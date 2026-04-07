@@ -81,6 +81,36 @@ def stringify_tool_output(content: Any) -> str:
     return str(content)
 
 
+def convert_content_from_responses(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+
+    parts = content if isinstance(content, list) else [content]
+    text_parts: List[str] = []
+    for part in parts:
+        if isinstance(part, str):
+            text_parts.append(part)
+            continue
+        if not isinstance(part, dict):
+            text = str(part) if part else ""
+            if text:
+                text_parts.append(text)
+            continue
+
+        ptype = part.get("type", "")
+        if ptype in {"text", "input_text", "output_text"}:
+            text = part.get("text", "")
+            if text is not None:
+                text_parts.append(str(text))
+            continue
+
+        text = part.get("text", "")
+        if text:
+            text_parts.append(str(text))
+
+    return "\n".join(chunk for chunk in text_parts if chunk)
+
+
 def chat_messages_to_responses_input(
     messages: List[Dict[str, Any]],
     *,
@@ -178,6 +208,77 @@ def chat_messages_to_responses_input(
             )
 
     return items
+
+
+def responses_input_to_chat_messages(
+    raw_items: Any,
+    *,
+    split_tool_id: Callable[[Any], Tuple[Optional[str], Optional[str]]] = split_responses_tool_id,
+) -> List[Dict[str, Any]]:
+    normalized_items = normalize_responses_input_items(raw_items)
+    messages: List[Dict[str, Any]] = []
+    current_assistant_index: Optional[int] = None
+
+    def _ensure_assistant_message() -> Dict[str, Any]:
+        nonlocal current_assistant_index
+        if current_assistant_index is not None:
+            return messages[current_assistant_index]
+
+        assistant_message: Dict[str, Any] = {"role": "assistant", "content": ""}
+        messages.append(assistant_message)
+        current_assistant_index = len(messages) - 1
+        return assistant_message
+
+    for item in normalized_items:
+        item_type = item.get("type")
+        if item_type == "reasoning":
+            assistant_message = _ensure_assistant_message()
+            reasoning_items = assistant_message.setdefault("codex_reasoning_items", [])
+            if isinstance(reasoning_items, list):
+                reasoning_items.append(dict(item))
+            continue
+
+        if item_type == "function_call":
+            assistant_message = _ensure_assistant_message()
+            tool_calls = assistant_message.setdefault("tool_calls", [])
+            if not isinstance(tool_calls, list):
+                tool_calls = []
+                assistant_message["tool_calls"] = tool_calls
+            tool_calls.append(
+                {
+                    "id": item["call_id"],
+                    "call_id": item["call_id"],
+                    "type": "function",
+                    "function": {
+                        "name": item["name"],
+                        "arguments": item["arguments"],
+                    },
+                }
+            )
+            continue
+
+        if item_type == "function_call_output":
+            call_id, _ = split_tool_id(item.get("call_id"))
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id or item["call_id"],
+                    "content": stringify_tool_output(item.get("output", "")),
+                }
+            )
+            current_assistant_index = None
+            continue
+
+        role = item.get("role")
+        if role in {"user", "assistant"}:
+            message = {
+                "role": role,
+                "content": convert_content_from_responses(item.get("content", "")),
+            }
+            messages.append(message)
+            current_assistant_index = len(messages) - 1 if role == "assistant" else None
+
+    return messages
 
 
 def normalize_responses_input_items(raw_items: Any) -> List[Dict[str, Any]]:
