@@ -1100,6 +1100,54 @@ def _prompt_provider_choice(choices, *, default=0):
             return None
 
 
+def _prompt_custom_api_mode_choice(current_api_mode=None):
+    """Prompt for the API protocol used by a custom endpoint."""
+    choices = [
+        ("OpenAI Chat Completions", "chat_completions"),
+        ("OpenAI Responses API", "codex_responses"),
+        ("Anthropic Messages", "anthropic_messages"),
+    ]
+    default_map = {
+        "chat_completions": 0,
+        "codex_responses": 1,
+        "anthropic_messages": 2,
+    }
+    default_idx = default_map.get(_normalize_explicit_api_mode(current_api_mode), 0)
+
+    try:
+        from hermes_cli.setup import _curses_prompt_choice
+        idx = _curses_prompt_choice(
+            "Select API type:",
+            [label for label, _ in choices],
+            default_idx,
+        )
+        if idx >= 0:
+            print()
+            return choices[idx][1]
+    except Exception:
+        pass
+
+    print("Select API type:")
+    for i, (label, _) in enumerate(choices, 1):
+        marker = "→" if i - 1 == default_idx else " "
+        print(f"  {marker} {i}. {label}")
+    print()
+    while True:
+        try:
+            val = input(f"Choice [1-{len(choices)}] ({default_idx + 1}): ").strip()
+            if not val:
+                return choices[default_idx][1]
+            idx = int(val) - 1
+            if 0 <= idx < len(choices):
+                return choices[idx][1]
+            print(f"Please enter 1-{len(choices)}")
+        except ValueError:
+            print("Please enter a number")
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return choices[default_idx][1]
+
+
 def _model_flow_openrouter(config, current_model=""):
     """OpenRouter provider: ensure API key, then pick model."""
     from hermes_cli.auth import _prompt_model_selection, _save_model_choice, deactivate_provider
@@ -1415,7 +1463,8 @@ def _model_flow_custom(config):
             print(f"Invalid context length: {context_length_str} — will auto-detect.")
             context_length = None
 
-    explicit_api_mode = _get_matching_custom_api_mode(config.get("model"), effective_url)
+    existing_api_mode = _get_matching_custom_api_mode(config.get("model"), effective_url)
+    explicit_api_mode = _prompt_custom_api_mode_choice(existing_api_mode)
 
     if model_name:
         _save_model_choice(model_name)

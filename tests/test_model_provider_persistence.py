@@ -260,6 +260,44 @@ class TestProviderPersistsAfterModelSave:
 
 
 class TestCustomProviderApiModePersistence:
+    def test_model_flow_custom_persists_selected_responses_api_mode(self, config_home, monkeypatch):
+        from hermes_cli.main import _model_flow_custom
+        from hermes_cli.config import load_config
+
+        monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "")
+        monkeypatch.setattr("hermes_cli.config.save_env_value", lambda key, value: None)
+        monkeypatch.setattr(
+            "hermes_cli.models.probe_api_models",
+            lambda api_key, base_url: {
+                "models": ["gpt-oss"],
+                "probed_url": "http://localhost:23000/v1/models",
+                "resolved_base_url": "http://localhost:23000/v1",
+                "suggested_base_url": None,
+                "used_fallback": False,
+            },
+        )
+        monkeypatch.setattr("hermes_cli.auth._save_model_choice", lambda model: None)
+        monkeypatch.setattr("hermes_cli.auth.deactivate_provider", lambda: None)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+
+        answers = iter([
+            "http://localhost:23000/v1",
+            "",
+            "",
+            "2",
+        ])
+        monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+        _model_flow_custom(load_config())
+
+        import yaml
+
+        config = yaml.safe_load((config_home / "config.yaml").read_text()) or {}
+        model = config.get("model") or {}
+        providers = config.get("custom_providers") or []
+        assert model.get("api_mode") == "codex_responses"
+        assert providers[0].get("api_mode") == "codex_responses"
+
     def test_model_flow_custom_preserves_existing_explicit_api_mode_for_same_endpoint(self, config_home, monkeypatch):
         from hermes_cli.main import _model_flow_custom
         from hermes_cli.config import load_config
@@ -290,6 +328,7 @@ class TestCustomProviderApiModePersistence:
 
         answers = iter([
             "http://localhost:23000/v1",
+            "",
             "",
             "",
         ])
