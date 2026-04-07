@@ -591,6 +591,34 @@ class TestGetTextAuxiliaryClient:
         assert mock_openai.call_args.kwargs["api_key"] == "no-key-required"
         assert mock_openai.call_args.kwargs["base_url"] == "http://localhost:2345/v1"
 
+    def test_task_direct_endpoint_honors_explicit_codex_responses_api_mode(self, monkeypatch):
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_BASE_URL", "http://localhost:2345/v1")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_API_KEY", "task-key")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_API_MODE", "codex_responses")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_MODEL", "task-model")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            client, model = get_text_auxiliary_client("web_extract")
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        assert isinstance(client, CodexAuxiliaryClient)
+        assert model == "task-model"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://localhost:2345/v1"
+        assert mock_openai.call_args.kwargs["api_key"] == "task-key"
+
+    def test_task_direct_endpoint_honors_explicit_anthropic_messages_api_mode(self, monkeypatch):
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_BASE_URL", "https://api.example.test/anthropic")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_API_KEY", "anthropic-key")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_API_MODE", "anthropic_messages")
+        monkeypatch.setenv("AUXILIARY_WEB_EXTRACT_MODEL", "claude-test")
+        with patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()):
+            client, model = get_text_auxiliary_client("web_extract")
+
+        assert client is not None
+        assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
+        assert model == "claude-test"
+
     def test_custom_endpoint_uses_config_saved_base_url(self, monkeypatch):
         config = {
             "model": {
@@ -672,6 +700,23 @@ class TestGetTextAuxiliaryClient:
         assert model == "gpt-5.3-codex"
         assert mock_openai.call_args.kwargs["base_url"] == "https://api.openai.com/v1"
         assert mock_openai.call_args.kwargs["api_key"] == "sk-test"
+
+    def test_vision_direct_endpoint_honors_explicit_codex_responses_api_mode(self, monkeypatch):
+        monkeypatch.setenv("AUXILIARY_VISION_BASE_URL", "http://localhost:4567/v1")
+        monkeypatch.setenv("AUXILIARY_VISION_API_KEY", "vision-key")
+        monkeypatch.setenv("AUXILIARY_VISION_API_MODE", "codex_responses")
+        monkeypatch.setenv("AUXILIARY_VISION_MODEL", "vision-model")
+        with patch("agent.auxiliary_client.OpenAI") as mock_openai:
+            mock_openai.return_value = MagicMock()
+            provider, client, model = resolve_vision_provider_client()
+
+        from agent.auxiliary_client import CodexAuxiliaryClient
+
+        assert provider == "custom"
+        assert isinstance(client, CodexAuxiliaryClient)
+        assert model == "vision-model"
+        assert mock_openai.call_args.kwargs["base_url"] == "http://localhost:4567/v1"
+        assert mock_openai.call_args.kwargs["api_key"] == "vision-key"
 
 
 class TestVisionClientFallback:

@@ -939,6 +939,22 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
     if custom_mode == "codex_responses":
         real_client = OpenAI(api_key=custom_key, base_url=custom_base)
         return CodexAuxiliaryClient(real_client, model), model
+    if custom_mode == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+        except ImportError:
+            return None, None
+        real_client = build_anthropic_client(custom_key, custom_base)
+        return (
+            AnthropicAuxiliaryClient(
+                real_client,
+                model,
+                custom_key,
+                custom_base,
+                is_oauth=_is_oauth_token(custom_key) or not str(custom_key).startswith("sk-ant-api"),
+            ),
+            model,
+        )
     return OpenAI(api_key=custom_key, base_url=custom_base), model
 
 
@@ -1436,6 +1452,21 @@ def resolve_provider_client(
                 model or _read_main_model() or "gpt-4o-mini",
                 provider,
             )
+            if api_mode == "anthropic_messages":
+                try:
+                    from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+                except ImportError:
+                    return None, None
+                real_client = build_anthropic_client(custom_key, custom_base)
+                client = AnthropicAuxiliaryClient(
+                    real_client,
+                    final_model,
+                    custom_key,
+                    custom_base,
+                    is_oauth=_is_oauth_token(custom_key) or not str(custom_key).startswith("sk-ant-api"),
+                )
+                return (_to_async_client(client, final_model) if async_mode
+                        else (client, final_model))
             extra = {}
             if "api.kimi.com" in custom_base.lower():
                 extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
@@ -1684,6 +1715,7 @@ def resolve_vision_provider_client(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
     async_mode: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
@@ -1694,7 +1726,7 @@ def resolve_vision_provider_client(
     stays conservative and only tries vision backends known to work today.
     """
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
+        "vision", provider, model, base_url, api_key, api_mode
     )
     requested = _normalize_vision_provider(requested)
 
@@ -1714,6 +1746,7 @@ def resolve_vision_provider_client(
             async_mode=async_mode,
             explicit_base_url=resolved_base_url,
             explicit_api_key=resolved_api_key,
+            api_mode=resolved_api_mode,
         )
         if client is None:
             return "custom", None, None
@@ -2006,6 +2039,7 @@ def _resolve_task_provider_model(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    api_mode: str = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -2054,12 +2088,13 @@ def _resolve_task_provider_model(
                 cfg_model = cfg_model or comp.get("summary_model", "").strip() or None
                 _sbu = comp.get("summary_base_url") or ""
                 cfg_base_url = cfg_base_url or _sbu.strip() or None
+                cfg_api_mode = cfg_api_mode or str(comp.get("summary_api_mode", "")).strip() or None
 
     # Env vars are backward-compat fallback only — config.yaml is primary.
     env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
     env_api_mode = _get_auxiliary_env_override(task, "API_MODE") if task else None
     resolved_model = model or cfg_model or env_model
-    resolved_api_mode = cfg_api_mode or env_api_mode
+    resolved_api_mode = api_mode or cfg_api_mode or env_api_mode
 
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
