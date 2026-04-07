@@ -577,8 +577,8 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     monkeypatch.setattr("getpass.getpass", lambda prompt="": "local-key")
 
     # After the probe detects a single model ("llm"), the flow asks
-    # "Use this model? [Y/n]:" — confirm with Enter, then context length.
-    answers = iter(["http://localhost:8000", "", ""])
+    # "Use this model? [Y/n]:", then context length, then API type.
+    answers = iter(["http://localhost:8000", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     monkeypatch.setattr("getpass.getpass", lambda _prompt="": next(answers))
 
@@ -590,6 +590,14 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     # OPENAI_BASE_URL is no longer saved to .env — config.yaml is authoritative
     assert "OPENAI_BASE_URL" not in saved_env
     assert saved_env["MODEL"] == "llm"
+
+
+def test_prompt_custom_api_mode_choice_maps_openai_responses(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
+
+    selected = hermes_main._prompt_custom_api_mode_choice()
+
+    assert selected == "codex_responses"
 
 
 def test_cmd_model_passes_explicit_api_mode_to_named_custom_provider(monkeypatch):
