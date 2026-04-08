@@ -574,10 +574,11 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
         lambda: {"model": {"default": "", "provider": "custom", "base_url": ""}},
     )
     monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+    monkeypatch.setattr("getpass.getpass", lambda prompt="": "local-key")
 
-    # After the probe detects a single model ("llm"), the flow asks
-    # "Use this model? [Y/n]:" — confirm with Enter, then context length.
-    answers = iter(["http://localhost:8000", "local-key", "", ""])
+    # After the probe detects a single model ("llm"), the flow asks for:
+    # base URL, API key, "Use this model? [Y/n]:", context length, then API type.
+    answers = iter(["http://localhost:8000", "", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
     monkeypatch.setattr("getpass.getpass", lambda _prompt="": next(answers))
 
@@ -589,6 +590,51 @@ def test_model_flow_custom_saves_verified_v1_base_url(monkeypatch, capsys):
     # OPENAI_BASE_URL is no longer saved to .env — config.yaml is authoritative
     assert "OPENAI_BASE_URL" not in saved_env
     assert saved_env["MODEL"] == "llm"
+
+
+def test_prompt_custom_api_mode_choice_maps_openai_responses(monkeypatch):
+    monkeypatch.setattr("builtins.input", lambda _prompt="": "2")
+
+    selected = hermes_main._prompt_custom_api_mode_choice()
+
+    assert selected == "codex_responses"
+
+
+def test_cmd_model_passes_explicit_api_mode_to_named_custom_provider(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "model": {"default": "gpt-oss", "provider": "custom"},
+            "custom_providers": [
+                {
+                    "name": "Local Responses",
+                    "base_url": "http://localhost:23000/v1",
+                    "model": "gpt-oss",
+                    "api_mode": "codex_responses",
+                }
+            ],
+        },
+    )
+    monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+    monkeypatch.setattr("hermes_cli.config.get_env_value", lambda key: "")
+    monkeypatch.setattr("hermes_cli.auth.resolve_provider", lambda requested, **kwargs: "custom")
+    monkeypatch.setattr(hermes_main, "_require_tty", lambda *args: None)
+    monkeypatch.setattr(
+        hermes_main,
+        "_prompt_provider_choice",
+        lambda choices, default=0: next(i for i, choice in enumerate(choices) if "Local Responses" in choice),
+    )
+
+    captured = {}
+
+    def _capture_named_custom(config, provider_info):
+        captured["provider_info"] = provider_info
+
+    monkeypatch.setattr(hermes_main, "_model_flow_named_custom", _capture_named_custom)
+
+    hermes_main.cmd_model(SimpleNamespace())
+
+    assert captured["provider_info"]["api_mode"] == "codex_responses"
 
 
 def test_cmd_model_forwards_nous_login_tls_options(monkeypatch):
