@@ -1119,13 +1119,13 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Approval dispatch failed: %s", self.name, e, exc_info=True)
                 return
 
-            # /status must also bypass the active-session guard so it always
-            # returns a system-generated response instead of being queued as
-            # user text and passed to the agent (#5046).
-            if cmd == "status":
+            # /status and /spawn must also bypass the active-session guard so
+            # they always return a system-generated response instead of being
+            # queued as user text and passed to the agent.
+            if cmd in ("status", "spawn"):
                 logger.debug(
-                    "[%s] Status command bypassing active-session guard for %s",
-                    self.name, session_key,
+                    "[%s] Command '/%s' bypassing active-session guard for %s",
+                    self.name, cmd, session_key,
                 )
                 try:
                     _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
@@ -1138,7 +1138,7 @@ class BasePlatformAdapter(ABC):
                             metadata=_thread_meta,
                         )
                 except Exception as e:
-                    logger.error("[%s] Status dispatch failed: %s", self.name, e, exc_info=True)
+                    logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
             # Special case: photo bursts/albums frequently arrive as multiple near-

@@ -36,11 +36,14 @@ def _make_runner():
     )
     runner.adapters = {Platform.TELEGRAM: _FakeAdapter()}
     runner._running_agents = {}
+    runner._running_agents_ts = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._voice_mode = {}
     runner._background_tasks = set()
     runner._is_user_authorized = lambda _source: True
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
     return runner
 
 
