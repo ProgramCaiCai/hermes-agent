@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -178,6 +179,37 @@ class _FakeCreateStream:
 
     def close(self):
         self.closed = True
+
+
+class _BrokenSDKStream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+
+class _FakeHTTPXStreamResponse:
+    def __init__(self, lines, *, status_code=200, headers=None):
+        self._lines = list(lines)
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "text/event-stream"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"unexpected status: {self.status_code}")
 
 
 def _codex_request_kwargs():
@@ -397,31 +429,122 @@ def test_run_codex_stream_custom_provider_hydrates_empty_terminal_output(monkeyp
         skip_context_files=True,
         skip_memory=True,
     )
-    stream = _FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.output_item.done",
-                item=SimpleNamespace(
-                    type="message",
-                    status="completed",
-                    content=[SimpleNamespace(type="output_text", text="custom ok")],
-                    phase="final_answer",
-                    role="assistant",
-                ),
-            ),
-            SimpleNamespace(
-                type="response.completed",
-                response=_custom_responses_empty_terminal(),
-            ),
-        ],
-        final_response=_custom_responses_empty_terminal(),
+    monkeypatch.setattr(
+        agent,
+        "_run_codex_raw_sse_stream_fallback",
+        lambda *args, **kwargs: _codex_message_response("custom ok"),
     )
 
-    response = agent._run_codex_stream(_codex_request_kwargs(), client=SimpleNamespace(
-        responses=SimpleNamespace(stream=lambda **kwargs: stream),
-    ))
+    response = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(
+            responses=SimpleNamespace(
+                stream=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK stream"),
+            ),
+        ),
+    )
 
     assert response.output[0].content[0].text == "custom ok"
+
+
+def test_run_codex_stream_falls_back_to_manual_sse_after_sdk_jsondecode_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    manual_response = _codex_message_response("manual sse ok")
+    calls = {"manual": 0}
+
+    def _manual_fallback(api_kwargs, client=None, on_first_delta=None):
+        calls["manual"] += 1
+        return manual_response
+
+    monkeypatch.setattr(agent, "_run_codex_raw_sse_stream_fallback", _manual_fallback)
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _BrokenSDKStream(),
+            create=lambda **kwargs: pytest.fail("should not use SDK create fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["manual"] == 1
+    assert response.output[0].content[0].text == "manual sse ok"
+
+
+def test_run_codex_stream_custom_provider_prefers_raw_sse_primary(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    manual_response = _codex_message_response("raw primary ok")
+    calls = {"manual": 0}
+
+    def _manual_primary(api_kwargs, client=None, on_first_delta=None):
+        calls["manual"] += 1
+        return manual_response
+
+    monkeypatch.setattr(agent, "_run_codex_raw_sse_stream_fallback", _manual_primary)
+
+    response = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(
+            responses=SimpleNamespace(
+                stream=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK stream"),
+                create=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK create"),
+            ),
+        ),
+    )
+
+    assert calls["manual"] == 1
+    assert response.output[0].content[0].text == "raw primary ok"
+
+
+def test_run_codex_raw_sse_stream_fallback_ignores_empty_event_frames(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    deltas = []
+    agent.stream_delta_callback = lambda text: deltas.append(text)
+
+    completed_response = {
+        "id": "resp_test",
+        "status": "completed",
+        "model": "gpt-5-codex",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    output_item = {
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    raw_stream = _FakeHTTPXStreamResponse(
+        [
+            "event: response.created",
+            "",
+            'data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress","model":"gpt-5-codex","output":[]}}',
+            "",
+            'data: {"type":"response.output_text.delta","delta":"OK","item_id":"msg_1","output_index":0,"content_index":0}',
+            "",
+            f'data: {json.dumps({"type": "response.output_item.done", "item": output_item})}',
+            "",
+            f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
+        ]
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("httpx.stream", lambda *args, **kwargs: raw_stream)
+        response = agent._run_codex_raw_sse_stream_fallback(_codex_request_kwargs())
+
+    assert deltas == ["OK"]
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "OK"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
