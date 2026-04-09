@@ -516,11 +516,12 @@ class TelegramAdapter(BasePlatformAdapter):
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
                 fallback_ips = await discover_fallback_ips()
-                logger.info(
-                    "[%s] Auto-discovered Telegram fallback IPs: %s",
-                    self.name,
-                    ", ".join(fallback_ips),
-                )
+                if fallback_ips:
+                    logger.info(
+                        "[%s] Auto-discovered Telegram fallback IPs: %s",
+                        self.name,
+                        ", ".join(fallback_ips),
+                    )
             if fallback_ips:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",

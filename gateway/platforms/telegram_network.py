@@ -192,6 +192,14 @@ async def discover_fallback_ips() -> list[str]:
     unreachable on this network).  Falls back to a hardcoded seed list when DoH
     is also unavailable.
     """
+    proxy_url = _resolve_proxy_url()
+    if proxy_url:
+        logger.info(
+            "[Telegram] Proxy detected (%s); skipping auto-discovery of fallback IPs",
+            proxy_url,
+        )
+        return []
+
     async with httpx.AsyncClient(timeout=httpx.Timeout(_DOH_TIMEOUT)) as client:
         doh_tasks = [_query_doh_provider(client, p) for p in _DOH_PROVIDERS]
         system_dns_task = asyncio.to_thread(_resolve_system_dns)

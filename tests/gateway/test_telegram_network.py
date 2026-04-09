@@ -642,3 +642,17 @@ class TestDiscoverFallbackIps:
 
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_proxy_env_skips_auto_discovery(self, monkeypatch):
+        """When an HTTP proxy is configured, local DNS fallback discovery is unnecessary."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:7892")
+
+        def _should_not_build_client(**kwargs):
+            raise AssertionError("DoH discovery should be skipped when a proxy is configured")
+
+        monkeypatch.setattr(tnet.httpx, "AsyncClient", _should_not_build_client)
+
+        ips = await tnet.discover_fallback_ips()
+
+        assert ips == []
