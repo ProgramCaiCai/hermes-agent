@@ -1835,6 +1835,37 @@ class AIAgent:
         url = (base_url or self._base_url_lower).lower()
         return "api.openai.com" in url and "openrouter" not in url
 
+    def _is_github_responses_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets GitHub's Responses-compatible API."""
+        url = str(base_url or self._base_url_lower).lower()
+        return "models.github.ai" in url or "api.githubcopilot.com" in url
+
+    def _is_chatgpt_codex_backend_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets chatgpt.com's Codex backend."""
+        url = str(base_url or self._base_url_lower).lower()
+        return "chatgpt.com/backend-api/codex" in url
+
+    def _should_prefer_raw_codex_sse(self, base_url: str = None) -> bool:
+        """Use the raw SSE parser as the primary path for custom Responses endpoints.
+
+        OpenAI's Python SDK is strict about SSE framing and rejects some
+        OpenAI-compatible gateways that emit empty event-only frames between
+        `event:` and `data:` lines. Codex avoids this class of bug by owning the
+        byte-stream/SSE parsing path directly; mirror that behavior for
+        non-native Responses endpoints here.
+        """
+        if self.api_mode != "codex_responses":
+            return False
+
+        normalized = str(base_url or self.base_url or self._base_url_lower).lower()
+        if self._is_direct_openai_url(normalized):
+            return False
+        if self._is_github_responses_url(normalized):
+            return False
+        if self._is_chatgpt_codex_backend_url(normalized):
+            return False
+        return True
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
@@ -4064,12 +4095,152 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _coerce_codex_sse_value(self, value: Any) -> Any:
+        """Convert raw SSE JSON payloads into attribute-style objects."""
+        if isinstance(value, dict):
+            return SimpleNamespace(
+                **{k: self._coerce_codex_sse_value(v) for k, v in value.items()}
+            )
+        if isinstance(value, list):
+            return [self._coerce_codex_sse_value(v) for v in value]
+        return value
+
+    def _run_codex_raw_sse_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+    ):
+        """Fallback parser for Responses SSE streams that the SDK rejects.
+
+        Some OpenAI-compatible gateways emit an empty SSE frame between the
+        `event:` and `data:` lines. The OpenAI Python SDK treats that as an
+        event with an empty payload and raises JSONDecodeError. This fallback
+        parses raw `data:` lines directly and ignores blank/event-only frames.
+        """
+        import httpx as _httpx
+
+        active_client = client or self._ensure_primary_openai_client(
+            reason="codex_raw_sse_stream_fallback"
+        )
+        fallback_kwargs = dict(api_kwargs)
+        fallback_kwargs["stream"] = True
+        fallback_kwargs = self._preflight_codex_api_kwargs(fallback_kwargs, allow_stream=True)
+
+        base_url = str(getattr(active_client, "base_url", None) or self.base_url).rstrip("/")
+        api_key = getattr(active_client, "api_key", None) or self.api_key
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        default_headers = dict(getattr(self, "_client_kwargs", {}).get("default_headers") or {})
+        for key, value in default_headers.items():
+            if value:
+                headers[key] = value
+
+        base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+        timeout = _httpx.Timeout(
+            connect=30.0,
+            read=stream_read_timeout,
+            write=base_timeout,
+            pool=30.0,
+        )
+
+        terminal_response = None
+        collected_output_items: list = []
+        collected_text_deltas: list = []
+        first_delta_fired = False
+
+        with _httpx.stream(
+            "POST",
+            f"{base_url}/responses",
+            headers=headers,
+            json=fallback_kwargs,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if raw_line is None:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "Skipping malformed raw Codex SSE payload during fallback. %s payload=%r",
+                        self._client_log_context(),
+                        payload[:200],
+                    )
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "response.output_item.done":
+                    done_item = event.get("item")
+                    if done_item is not None:
+                        collected_output_items.append(self._coerce_codex_sse_value(done_item))
+                elif event_type == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        collected_text_deltas.append(delta)
+                        if not first_delta_fired and on_first_delta:
+                            first_delta_fired = True
+                            try:
+                                on_first_delta()
+                            except Exception:
+                                pass
+                        self._fire_stream_delta(delta)
+                elif event_type and "reasoning" in event_type and "delta" in event_type:
+                    reasoning_text = event.get("delta", "")
+                    if reasoning_text:
+                        self._fire_reasoning_delta(reasoning_text)
+                elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                    terminal_response = event.get("response")
+
+        if terminal_response is None:
+            raise RuntimeError("Raw SSE fallback did not emit a terminal response.")
+
+        terminal_response = self._coerce_codex_sse_value(terminal_response)
+        _out = getattr(terminal_response, "output", None)
+        if isinstance(_out, list) and not _out:
+            if collected_output_items:
+                terminal_response.output = list(collected_output_items)
+            elif collected_text_deltas:
+                assembled = "".join(collected_text_deltas)
+                terminal_response.output = [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )]
+        return terminal_response
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
 
         api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
+        active_base_url = str(getattr(active_client, "base_url", None) or self.base_url or "")
+        if self._should_prefer_raw_codex_sse(active_base_url):
+            logger.debug(
+                "Codex Responses stream using raw SSE as primary transport for custom endpoint. %s",
+                self._client_log_context(),
+            )
+            return self._run_codex_raw_sse_stream_fallback(
+                api_kwargs,
+                client=active_client,
+                on_first_delta=on_first_delta,
+            )
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
@@ -4168,6 +4339,18 @@ class AIAgent:
                     exc,
                 )
                 return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            except json.JSONDecodeError as exc:
+                logger.debug(
+                    "Codex Responses stream emitted malformed SSE payload; "
+                    "falling back to raw SSE parser. %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_raw_sse_stream_fallback(
+                    api_kwargs,
+                    client=active_client,
+                    on_first_delta=on_first_delta,
+                )
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -4252,6 +4435,14 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "Codex create(stream=True) emitted malformed SSE payload; "
+                "falling back to raw SSE parser. %s error=%s",
+                self._client_log_context(),
+                exc,
+            )
+            return self._run_codex_raw_sse_stream_fallback(api_kwargs, client=active_client)
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -5269,19 +5460,23 @@ class AIAgent:
             except Exception:
                 pass
 
-            # Determine api_mode from provider / base URL / model
-            fb_api_mode = "chat_completions"
+            # Respect an explicit fallback api_mode when configured; otherwise
+            # infer from provider / base URL like the primary runtime does.
+            explicit_fb_api_mode = str(fb.get("api_mode") or "").strip().lower()
+            if explicit_fb_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+                fb_api_mode = explicit_fb_api_mode
+            else:
+                fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
-            if fb_provider == "openai-codex":
-                fb_api_mode = "codex_responses"
-            elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
-                fb_api_mode = "anthropic_messages"
-            elif self._is_direct_openai_url(fb_base_url):
-                fb_api_mode = "codex_responses"
-            elif self._model_requires_responses_api(fb_model):
-                # GPT-5.x models need Responses API on every provider
-                # (OpenRouter, Copilot, direct OpenAI, etc.)
-                fb_api_mode = "codex_responses"
+            if explicit_fb_api_mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
+                if fb_provider == "openai-codex":
+                    fb_api_mode = "codex_responses"
+                elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
+                    fb_api_mode = "anthropic_messages"
+                elif self._is_direct_openai_url(fb_base_url):
+                    fb_api_mode = "codex_responses"
+                elif self._model_requires_responses_api(fb_model):
+                    fb_api_mode = "codex_responses"
 
             old_model = self.model
             self.model = fb_model

@@ -191,6 +191,29 @@ class TestLaunchdServiceRecovery:
             == DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
         )
 
+    def test_launchd_plist_is_current_ignores_codex_ephemeral_path_entries(self, tmp_path, monkeypatch):
+        plist_path = tmp_path / "ai.hermes.gateway.plist"
+        monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: plist_path)
+
+        original_path = os.environ.get("PATH", "")
+        try:
+            os.environ["PATH"] = (
+                "/Users/programcaicai/.hermes/hermes-agent/venv/bin:"
+                "/Users/programcaicai/.codex/tmp/arg0/codex-arg0AAAAAA:"
+                "/opt/homebrew/bin"
+            )
+            plist_path.write_text(gateway_cli.generate_launchd_plist(), encoding="utf-8")
+
+            os.environ["PATH"] = (
+                "/Users/programcaicai/.hermes/hermes-agent/venv/bin:"
+                "/Users/programcaicai/.codex/tmp/arg0/codex-arg0BBBBBB:"
+                "/opt/homebrew/bin"
+            )
+
+            assert gateway_cli.launchd_plist_is_current() is True
+        finally:
+            os.environ["PATH"] = original_path
+
     def test_launchd_install_repairs_outdated_plist_without_force(self, tmp_path, monkeypatch):
         plist_path = tmp_path / "ai.hermes.gateway.plist"
         plist_path.write_text("<plist>old content</plist>", encoding="utf-8")

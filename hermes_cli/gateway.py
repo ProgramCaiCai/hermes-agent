@@ -6,6 +6,7 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 
 import asyncio
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+_CODEX_ARG0_PATH_RE = re.compile(r"/[^:<\"\n]*?\.codex/tmp/arg0/codex-arg0[^:<\"\n]*")
 
 from gateway.status import terminate_pid
 from gateway.restart import (
@@ -837,7 +839,7 @@ def generate_systemd_unit(system: bool = False, run_as_user: str | None = None) 
         path_entries = [_remap_path_for_user(p, home_dir) for p in path_entries]
         path_entries.extend(_build_user_local_paths(Path(home_dir), path_entries))
         path_entries.extend(common_bin_paths)
-        sane_path = ":".join(path_entries)
+        sane_path = ":".join(_stable_service_path_entries(path_entries))
         return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network-online.target
@@ -875,7 +877,7 @@ WantedBy=multi-user.target
     profile_arg = _profile_arg(hermes_home)
     path_entries.extend(_build_user_local_paths(Path.home(), path_entries))
     path_entries.extend(common_bin_paths)
-    sane_path = ":".join(path_entries)
+    sane_path = ":".join(_stable_service_path_entries(path_entries))
     return f"""[Unit]
 Description={SERVICE_DESCRIPTION}
 After=network.target
@@ -904,6 +906,7 @@ WantedBy=default.target
 """
 
 def _normalize_service_definition(text: str) -> str:
+    text = _CODEX_ARG0_PATH_RE.sub("<CODEX_ARG0>", text)
     return "\n".join(line.rstrip() for line in text.strip().splitlines())
 
 
@@ -1239,7 +1242,7 @@ def generate_launchd_plist() -> str:
         if resolved_node_dir not in priority_dirs:
             priority_dirs.append(resolved_node_dir)
     sane_path = ":".join(
-        dict.fromkeys(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
+        _stable_service_path_entries(priority_dirs + [p for p in os.environ.get("PATH", "").split(":") if p])
     )
 
     # Build ProgramArguments array, including --profile when using a named profile
@@ -3021,3 +3024,22 @@ def gateway_command(args):
                 else:
                     print("  hermes gateway install  # Install as user service")
                     print("  sudo hermes gateway install --system  # Install as boot-time system service")
+
+
+def _is_ephemeral_service_path_entry(path_entry: str) -> bool:
+    """Return True for transient shell-injected paths that should not be persisted."""
+    return "/.codex/tmp/arg0/codex-arg0" in str(path_entry or "")
+
+
+def _stable_service_path_entries(entries: list[str]) -> list[str]:
+    """Drop transient PATH entries and deduplicate while preserving order."""
+    stable: list[str] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not entry or _is_ephemeral_service_path_entry(entry):
+            continue
+        if entry in seen:
+            continue
+        seen.add(entry)
+        stable.append(entry)
+    return stable
