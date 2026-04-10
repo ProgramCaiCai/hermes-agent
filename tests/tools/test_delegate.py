@@ -16,6 +16,8 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -52,6 +54,11 @@ def _make_mock_parent(depth=0):
     parent.tool_progress_callback = None
     parent.thinking_callback = None
     return parent
+
+
+@pytest.fixture(autouse=True)
+def _clear_delegation_runtime_config(monkeypatch):
+    monkeypatch.setattr("tools.delegate_tool._load_config", lambda: {})
 
 
 class TestDelegateRequirements(unittest.TestCase):
@@ -236,7 +243,8 @@ class TestDelegateTask(unittest.TestCase):
         parent.provider = "openai-codex"
         parent.api_mode = "codex_responses"
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with patch("tools.delegate_tool._load_config", return_value={}), \
+             patch("run_agent.AIAgent") as MockAgent:
             mock_child = MagicMock()
             mock_child.run_conversation.return_value = {
                 "final_response": "ok",

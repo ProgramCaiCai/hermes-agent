@@ -152,7 +152,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None):
+        def _capture_post(url, json=None, timeout=None, **kwargs):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": "tab-1", "url": "https://example.com"}
@@ -172,7 +172,7 @@ class TestManagedPersistenceMode:
 
         requests_seen = []
 
-        def _capture_post(url, json=None, timeout=None):
+        def _capture_post(url, json=None, timeout=None, **kwargs):
             requests_seen.append(json)
             return _mock_response(
                 json_data={"tabId": f"tab-{len(requests_seen)}", "url": "https://example.com"}

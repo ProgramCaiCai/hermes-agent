@@ -40,6 +40,25 @@ def _isolate_hermes_home(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
     # Avoid making real calls during tests if this key is set in the env files
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    # Keep test execution deterministic by clearing common host/user overrides
+    # that otherwise leak between unrelated tests via process-global env.
+    for env_name in (
+        "OPENAI_API_KEY",
+        "VOICE_TOOLS_OPENAI_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_API_BASE",
+        "CAMOFOX_URL",
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_ADMIN_IDS",
+        "TOOL_GATEWAY_DOMAIN",
+        "TOOL_GATEWAY_SCHEME",
+        "TOOL_GATEWAY_USER_TOKEN",
+        "HERMES_ENABLE_NOUS_MANAGED_TOOLS",
+        "TERMINAL_MODAL_MODE",
+        "MODAL_TOKEN_ID",
+        "MODAL_TOKEN_SECRET",
+    ):
+        monkeypatch.delenv(env_name, raising=False)
 
 
 @pytest.fixture()
