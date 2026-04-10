@@ -493,6 +493,7 @@ class TestDiscoverFallbackIps:
         """Wire up fake DoH client and system DNS."""
         client = FakeDoHClient(responses)
         monkeypatch.setattr(tnet.httpx, "AsyncClient", lambda **kw: client)
+        monkeypatch.setattr(tnet, "_resolve_proxy_url", lambda: None)
 
         if system_dns_ips is not None:
             addrs = [(None, None, None, None, (ip, 443)) for ip in system_dns_ips]
@@ -642,3 +643,25 @@ class TestDiscoverFallbackIps:
 
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.167.220"]
+
+    @pytest.mark.asyncio
+    async def test_proxy_skips_auto_discovery(self, monkeypatch):
+        calls = {"async_client": 0, "getaddrinfo": 0}
+
+        monkeypatch.setattr(tnet, "_resolve_proxy_url", lambda: "http://127.0.0.1:7892")
+
+        def _unexpected_client(**kwargs):
+            calls["async_client"] += 1
+            raise AssertionError("AsyncClient should not be created when proxy is active")
+
+        def _unexpected_getaddrinfo(*args, **kwargs):
+            calls["getaddrinfo"] += 1
+            raise AssertionError("System DNS lookup should not run when proxy is active")
+
+        monkeypatch.setattr(tnet.httpx, "AsyncClient", _unexpected_client)
+        monkeypatch.setattr(tnet.socket, "getaddrinfo", _unexpected_getaddrinfo)
+
+        ips = await tnet.discover_fallback_ips()
+
+        assert ips == []
+        assert calls == {"async_client": 0, "getaddrinfo": 0}
