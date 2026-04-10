@@ -819,8 +819,6 @@ def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch
     assert result["include"] == ["reasoning.encrypted_content"]
     assert result["temperature"] == 0.7
     assert result["max_output_tokens"] == 4096
-
-
 def test_run_codex_stream_rejects_invalid_tool_role_input_without_preflight(monkeypatch):
     agent = _build_agent(monkeypatch)
 
@@ -834,6 +832,15 @@ def test_run_codex_stream_rejects_invalid_tool_role_input_without_preflight(monk
                 "store": False,
             }
         )
+
+
+def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["service_tier"] = "priority"
+
+    result = agent._preflight_codex_api_kwargs(kwargs)
+    assert result["service_tier"] == "priority"
 
 
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):

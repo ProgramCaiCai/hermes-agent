@@ -204,8 +204,16 @@ def _build_explicit_custom_client(
     api_mode: Optional[str] = None,
 ) -> Tuple[Optional[Any], Optional[str]]:
     resolved_mode = _normalize_api_mode(api_mode) or "chat_completions"
+    extra = {}
+    base_lower = str(base_url or "").lower()
+    if "api.kimi.com" in base_lower:
+        extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
+    elif "api.githubcopilot.com" in base_lower:
+        from hermes_cli.models import copilot_default_headers
+
+        extra["default_headers"] = copilot_default_headers()
     if resolved_mode == "codex_responses":
-        real_client = OpenAI(api_key=api_key, base_url=_to_openai_base_url(base_url))
+        real_client = OpenAI(api_key=api_key, base_url=_to_openai_base_url(base_url), **extra)
         return CodexAuxiliaryClient(real_client, model), model
 
     if resolved_mode == "anthropic_messages":
@@ -228,7 +236,7 @@ def _build_explicit_custom_client(
             model,
         )
 
-    return OpenAI(api_key=api_key, base_url=_to_openai_base_url(base_url)), model
+    return OpenAI(api_key=api_key, base_url=_to_openai_base_url(base_url), **extra), model
 
 
 def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
@@ -655,11 +663,19 @@ def _nous_base_url() -> str:
 
 
 def _read_codex_access_token() -> Optional[str]:
-    """Read a valid, non-expired Codex OAuth access token from Hermes auth store."""
+    """Read a valid, non-expired Codex OAuth access token from Hermes auth store.
+
+    If a credential pool exists but currently has no selectable runtime entry
+    (for example all pool slots are marked exhausted), fall back to the
+    profile's auth.json token instead of hard-failing. This keeps explicit
+    fallback-to-Codex working when the pool state is stale but the stored OAuth
+    token is still valid.
+    """
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         token = _pool_runtime_api_key(entry)
-        return token or None
+        if token:
+            return token
 
     try:
         from hermes_cli.auth import _read_codex_tokens
@@ -720,7 +736,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
             logger.debug("Auxiliary text client: %s (%s) via pool", pconfig.name, model)
             extra = {}
             if "api.kimi.com" in base_url.lower():
-                extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+                extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
             elif "api.githubcopilot.com" in base_url.lower():
                 from hermes_cli.models import copilot_default_headers
 
@@ -739,7 +755,7 @@ def _resolve_api_key_provider() -> Tuple[Optional[OpenAI], Optional[str]]:
         logger.debug("Auxiliary text client: %s (%s)", pconfig.name, model)
         extra = {}
         if "api.kimi.com" in base_url.lower():
-            extra["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+            extra["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
         elif "api.githubcopilot.com" in base_url.lower():
             from hermes_cli.models import copilot_default_headers
 
@@ -860,7 +876,7 @@ def _read_main_provider() -> str:
         if isinstance(model_cfg, dict):
             provider = model_cfg.get("provider", "")
             if isinstance(provider, str) and provider.strip():
-                return _normalize_aux_provider(provider)
+                return provider.strip().lower()
     except Exception:
         pass
     return ""
@@ -926,9 +942,13 @@ def _try_codex() -> Tuple[Optional[Any], Optional[str]]:
     pool_present, entry = _select_pool_entry("openai-codex")
     if pool_present:
         codex_token = _pool_runtime_api_key(entry)
-        if not codex_token:
-            return None, None
-        base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+        if codex_token:
+            base_url = _pool_runtime_base_url(entry, _CODEX_AUX_BASE_URL) or _CODEX_AUX_BASE_URL
+        else:
+            codex_token = _read_codex_access_token()
+            if not codex_token:
+                return None, None
+            base_url = _CODEX_AUX_BASE_URL
     else:
         codex_token = _read_codex_access_token()
         if not codex_token:
@@ -1067,6 +1087,32 @@ def _is_payment_error(exc: Exception) -> bool:
     return False
 
 
+def _is_connection_error(exc: Exception) -> bool:
+    """Detect connection/network errors that warrant provider fallback.
+
+    Returns True for errors indicating the provider endpoint is unreachable
+    (DNS failure, connection refused, TLS errors, timeouts).  These are
+    distinct from API errors (4xx/5xx) which indicate the provider IS
+    reachable but returned an error.
+    """
+    from openai import APIConnectionError, APITimeoutError
+
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    # urllib3 / httpx / httpcore connection errors
+    err_type = type(exc).__name__
+    if any(kw in err_type for kw in ("Connection", "Timeout", "DNS", "SSL")):
+        return True
+    err_lower = str(exc).lower()
+    if any(kw in err_lower for kw in (
+        "connection refused", "name or service not known",
+        "no route to host", "network is unreachable",
+        "timed out", "connection reset",
+    )):
+        return True
+    return False
+
+
 def _try_payment_fallback(
     failed_provider: str,
     task: str = None,
@@ -1131,7 +1177,7 @@ def _resolve_auto() -> Tuple[Optional[OpenAI], Optional[str]]:
     main_model = _read_main_model()
     if (main_provider and main_model
             and main_provider not in _AGGREGATOR_PROVIDERS
-            and main_provider not in ("auto", "custom", "")):
+            and main_provider not in ("auto", "")):
         client, resolved = resolve_provider_client(main_provider, main_model)
         if client is not None:
             logger.info("Auxiliary auto-detect: using main provider %s (%s)",
@@ -1189,7 +1235,7 @@ def _to_async_client(sync_client, model: str):
 
         async_kwargs["default_headers"] = copilot_default_headers()
     elif "api.kimi.com" in base_lower:
-        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.0"}
+        async_kwargs["default_headers"] = {"User-Agent": "KimiCLI/1.3"}
     return AsyncOpenAI(**async_kwargs), model
 
 
@@ -1405,7 +1451,7 @@ def resolve_provider_client(
         # Provider-specific headers
         headers = {}
         if "api.kimi.com" in base_url.lower():
-            headers["User-Agent"] = "KimiCLI/1.0"
+            headers["User-Agent"] = "KimiCLI/1.3"
         elif "api.githubcopilot.com" in base_url.lower():
             from hermes_cli.models import copilot_default_headers
 
@@ -1521,19 +1567,25 @@ def _preferred_main_vision_provider() -> Optional[str]:
 def get_available_vision_backends() -> List[str]:
     """Return the currently available vision backends in auto-selection order.
 
-    Order: OpenRouter → Nous → active provider.  This is the single source
-    of truth for setup, tool gating, and runtime auto-routing of vision tasks.
+    Order: active provider → OpenRouter → Nous → stop.  This is the single
+    source of truth for setup, tool gating, and runtime auto-routing of
+    vision tasks.
     """
-    available = [p for p in _VISION_AUTO_PROVIDER_ORDER
-                 if _strict_vision_backend_available(p)]
-    # Also check the user's active provider (may be DeepSeek, Alibaba, named
-    # custom, etc.) — resolve_provider_client handles all provider types.
+    available: List[str] = []
+    # 1. Active provider — if the user configured a provider, try it first.
     main_provider = _read_main_provider()
-    if (main_provider and main_provider not in ("auto", "")
-            and main_provider not in available):
-        client, _ = resolve_provider_client(main_provider, _read_main_model())
-        if client is not None:
-            available.append(main_provider)
+    if main_provider and main_provider not in ("auto", ""):
+        if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+            if _strict_vision_backend_available(main_provider):
+                available.append(main_provider)
+        else:
+            client, _ = resolve_provider_client(main_provider, _read_main_model())
+            if client is not None:
+                available.append(main_provider)
+    # 2. OpenRouter, 3. Nous — skip if already covered by main provider.
+    for p in _VISION_AUTO_PROVIDER_ORDER:
+        if p not in available and _strict_vision_backend_available(p):
+            available.append(p)
     return available
 
 
@@ -1582,28 +1634,37 @@ def resolve_vision_provider_client(
 
     if requested == "auto":
         # Vision auto-detection order:
-        #   1. OpenRouter  (known vision-capable default model)
-        #   2. Nous Portal (known vision-capable default model)
-        #   3. Active provider + model (user's main chat config)
+        #   1. Active provider + model (user's main chat config)
+        #   2. OpenRouter  (known vision-capable default model)
+        #   3. Nous Portal (known vision-capable default model)
         #   4. Stop
-        for candidate in _VISION_AUTO_PROVIDER_ORDER:
-            sync_client, default_model = _resolve_strict_vision_backend(candidate)
-            if sync_client is not None:
-                return _finalize(candidate, sync_client, default_model)
-
-        # Fall back to the user's active provider + model.
         main_provider = _read_main_provider()
         main_model = _read_main_model()
         if main_provider and main_provider not in ("auto", ""):
-            sync_client, resolved_model = resolve_provider_client(
-                main_provider, main_model)
+            if main_provider in _VISION_AUTO_PROVIDER_ORDER:
+                # Known strict backend — use its defaults.
+                sync_client, default_model = _resolve_strict_vision_backend(main_provider)
+                if sync_client is not None:
+                    return _finalize(main_provider, sync_client, default_model)
+            else:
+                # Exotic provider (DeepSeek, Alibaba, named custom, etc.)
+                rpc_client, rpc_model = resolve_provider_client(
+                    main_provider, main_model)
+                if rpc_client is not None:
+                    logger.info(
+                        "Vision auto-detect: using active provider %s (%s)",
+                        main_provider, rpc_model or main_model,
+                    )
+                    return _finalize(
+                        main_provider, rpc_client, rpc_model or main_model)
+
+        # Fall back through aggregators.
+        for candidate in _VISION_AUTO_PROVIDER_ORDER:
+            if candidate == main_provider:
+                continue  # already tried above
+            sync_client, default_model = _resolve_strict_vision_backend(candidate)
             if sync_client is not None:
-                logger.info(
-                    "Vision auto-detect: using active provider %s (%s)",
-                    main_provider, resolved_model or main_model,
-                )
-                return _finalize(
-                    main_provider, sync_client, resolved_model or main_model)
+                return _finalize(candidate, sync_client, default_model)
 
         logger.debug("Auxiliary vision client: none available")
         return None, None, None
@@ -2130,7 +2191,18 @@ def call_llm(
         # try alternative providers instead of giving up.  This handles the
         # common case where a user runs out of OpenRouter credits but has
         # Codex OAuth or another provider available.
-        if _is_payment_error(first_err):
+        #
+        # ── Connection error fallback ────────────────────────────────
+        # When a provider endpoint is unreachable (DNS failure, connection
+        # refused, timeout), try alternative providers.  This handles stale
+        # Codex/OAuth tokens that authenticate but whose endpoint is down,
+        # and providers the user never configured that got picked up by
+        # the auto-detection chain.
+        should_fallback = _is_payment_error(first_err) or _is_connection_error(first_err)
+        if should_fallback:
+            reason = "payment error" if _is_payment_error(first_err) else "connection error"
+            logger.info("Auxiliary %s: %s on %s (%s), trying fallback",
+                        task or "call", reason, resolved_provider, first_err)
             fb_client, fb_model, fb_label = _try_payment_fallback(
                 resolved_provider, task)
             if fb_client is not None:
