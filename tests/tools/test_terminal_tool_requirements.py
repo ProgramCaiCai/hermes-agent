@@ -3,25 +3,32 @@
 import importlib
 
 from model_tools import get_tool_definitions
+from tools.registry import registry
 
-terminal_tool_module = importlib.import_module("tools.terminal_tool")
+
+def _terminal_tool_module():
+    return importlib.import_module("tools.terminal_tool")
+
+
+def _force_terminal_available(monkeypatch):
+    monkeypatch.setattr(registry._tools["terminal"], "check_fn", lambda: True)
 
 
 class TestTerminalRequirements:
     def test_local_backend_requirements(self, monkeypatch):
+        terminal_tool_module = _terminal_tool_module()
         monkeypatch.setattr(
-            terminal_tool_module,
-            "_get_env_config",
+            "tools.terminal_tool._get_env_config",
             lambda: {"env_type": "local"},
         )
         assert terminal_tool_module.check_terminal_requirements() is True
 
     def test_terminal_and_file_tools_resolve_for_local_backend(self, monkeypatch):
         monkeypatch.setattr(
-            terminal_tool_module,
-            "_get_env_config",
+            "tools.terminal_tool._get_env_config",
             lambda: {"env_type": "local"},
         )
+        _force_terminal_available(monkeypatch)
         tools = get_tool_definitions(enabled_toolsets=["terminal", "file"], quiet_mode=True)
         names = {tool["function"]["name"] for tool in tools}
         assert "terminal" in names
@@ -29,25 +36,24 @@ class TestTerminalRequirements:
 
     def test_terminal_and_execute_code_tools_resolve_for_managed_modal(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_ENABLE_NOUS_MANAGED_TOOLS", "1")
+        monkeypatch.setenv("TERMINAL_MODAL_MODE", "managed")
         monkeypatch.setenv("HOME", str(tmp_path))
         monkeypatch.setenv("USERPROFILE", str(tmp_path))
         monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
         monkeypatch.delenv("MODAL_TOKEN_SECRET", raising=False)
         monkeypatch.setattr(
-            terminal_tool_module,
-            "_get_env_config",
+            "tools.terminal_tool._get_env_config",
             lambda: {"env_type": "modal", "modal_mode": "managed"},
         )
         monkeypatch.setattr(
-            terminal_tool_module,
-            "is_managed_tool_gateway_ready",
+            "tools.terminal_tool.is_managed_tool_gateway_ready",
             lambda _vendor: True,
         )
         monkeypatch.setattr(
-            terminal_tool_module,
-            "ensure_minisweagent_on_path",
+            "tools.terminal_tool.ensure_minisweagent_on_path",
             lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("should not be called")),
         )
+        _force_terminal_available(monkeypatch)
 
         tools = get_tool_definitions(enabled_toolsets=["terminal", "code_execution"], quiet_mode=True)
         names = {tool["function"]["name"] for tool in tools}
