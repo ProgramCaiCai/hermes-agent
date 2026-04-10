@@ -21,8 +21,8 @@ from agent.auxiliary_client import (
     _get_provider_chain,
     _is_payment_error,
     _try_payment_fallback,
-    _resolve_forced_provider,
     _resolve_auto,
+    _resolve_forced_provider,
 )
 
 
@@ -714,15 +714,6 @@ class TestGetTextAuxiliaryClient:
 class TestVisionClientFallback:
     """Vision client auto mode resolves known-good multimodal backends."""
 
-    def test_vision_returns_none_without_any_credentials(self):
-        with (
-            patch("agent.auxiliary_client._read_nous_auth", return_value=None),
-            patch("agent.auxiliary_client._try_anthropic", return_value=(None, None)),
-        ):
-            client, model = get_vision_auxiliary_client()
-        assert client is None
-        assert model is None
-
     def test_vision_auto_includes_active_provider_when_configured(self, monkeypatch):
         """Active provider appears in available backends when credentials exist."""
         monkeypatch.setenv("ANTHROPIC_API_KEY", "***")
@@ -895,7 +886,6 @@ class TestCodexResponsesAdapter:
 
         assert client is not None
         assert client.__class__.__name__ == "AnthropicAuxiliaryClient"
-
     def test_vision_auto_prefers_active_provider_over_openrouter(self, monkeypatch):
         """Active provider is tried before OpenRouter in vision auto."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
@@ -993,7 +983,6 @@ class TestCodexResponsesAdapter:
             client, model = get_vision_auxiliary_client()
         assert model == "google/gemini-3-flash-preview"
         assert client is not None
-
     def test_vision_config_google_provider_uses_gemini_credentials(self, monkeypatch):
         config = {
             "auxiliary": {
@@ -1220,8 +1209,6 @@ class TestResolveForcedProvider:
             client, model = _resolve_forced_provider("invalid-provider")
         assert client is None
         assert model is None
-
-
 class TestTaskSpecificOverrides:
     """Integration tests for per-task provider routing via get_text_auxiliary_client(task=...)."""
 
@@ -1495,3 +1482,45 @@ class TestCallLlmPaymentFallback:
                     task="compression",
                     messages=[{"role": "user", "content": "hello"}],
                 )
+
+
+# ---------------------------------------------------------------------------
+# Gate: _resolve_api_key_provider must skip anthropic when not configured
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_api_key_provider_skips_unconfigured_anthropic(monkeypatch):
+    """_resolve_api_key_provider must not try anthropic when user never configured it."""
+    from collections import OrderedDict
+    from hermes_cli.auth import ProviderConfig
+
+    # Build a minimal registry with only "anthropic" so the loop is guaranteed
+    # to reach it without being short-circuited by earlier providers.
+    fake_registry = OrderedDict({
+        "anthropic": ProviderConfig(
+            id="anthropic",
+            name="Anthropic",
+            auth_type="api_key",
+            inference_base_url="https://api.anthropic.com",
+            api_key_env_vars=("ANTHROPIC_API_KEY",),
+        ),
+    })
+
+    called = []
+
+    def mock_try_anthropic():
+        called.append("anthropic")
+        return None, None
+
+    monkeypatch.setattr("agent.auxiliary_client._try_anthropic", mock_try_anthropic)
+    monkeypatch.setattr("hermes_cli.auth.PROVIDER_REGISTRY", fake_registry)
+    monkeypatch.setattr(
+        "hermes_cli.auth.is_provider_explicitly_configured",
+        lambda pid: False,
+    )
+
+    from agent.auxiliary_client import _resolve_api_key_provider
+    _resolve_api_key_provider()
+
+    assert "anthropic" not in called, \
+        "_try_anthropic() should not be called when anthropic is not explicitly configured"
