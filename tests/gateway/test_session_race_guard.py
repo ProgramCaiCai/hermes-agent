@@ -243,7 +243,8 @@ async def test_stop_during_sentinel_force_cleans_session():
         assert session_key not in adapter._pending_messages
 
         barrier.set()
-        await task1
+        with pytest.raises(asyncio.CancelledError):
+            await task1
 
 
 # ------------------------------------------------------------------
@@ -281,6 +282,43 @@ async def test_stop_hard_kills_running_agent():
     # Must return a confirmation
     assert result is not None
     assert "force-stopped" in result.lower() or "unlocked" in result.lower()
+
+
+# ------------------------------------------------------------------
+# Test 6bb: /stop cancels the active gateway task, not just the agent flag
+# ------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_stop_cancels_running_gateway_task():
+    """When /stop arrives, the active gateway task must be cancelled so
+    the session stops retrying in the background."""
+    runner = _make_runner()
+    session_key = build_session_key(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="12345", chat_type="dm")
+    )
+
+    fake_agent = MagicMock()
+    runner._running_agents[session_key] = fake_agent
+    runner._running_tasks = {}
+    runner._session_run_tokens = {session_key: object()}
+
+    cancelled = asyncio.Event()
+
+    async def fake_gateway_task():
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    run_task = asyncio.create_task(fake_gateway_task())
+    runner._running_tasks[session_key] = run_task
+
+    stop_event = _make_event(text="/stop")
+    result = await runner._handle_message(stop_event)
+
+    assert result is not None
+    await asyncio.sleep(0)
+    assert run_task.cancelled() or cancelled.is_set()
 
 
 # ------------------------------------------------------------------
