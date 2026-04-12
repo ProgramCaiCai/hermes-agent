@@ -4141,6 +4141,13 @@ class AIAgent:
 
         base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
         stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+        if stream_read_timeout == 60.0 and base_url and is_local_endpoint(base_url):
+            stream_read_timeout = base_timeout
+            logger.debug(
+                "Local provider detected (%s) — Codex raw SSE read timeout raised to %.0fs",
+                base_url,
+                stream_read_timeout,
+            )
         timeout = _httpx.Timeout(
             connect=30.0,
             read=stream_read_timeout,
@@ -4153,7 +4160,12 @@ class AIAgent:
         collected_text_deltas: list = []
         first_delta_fired = False
 
-        with _httpx.stream(
+        request_httpx_client = getattr(active_client, "_client", None)
+        stream_request = getattr(request_httpx_client, "stream", None)
+        if not callable(stream_request):
+            stream_request = _httpx.stream
+
+        with stream_request(
             "POST",
             f"{base_url}/responses",
             headers=headers,

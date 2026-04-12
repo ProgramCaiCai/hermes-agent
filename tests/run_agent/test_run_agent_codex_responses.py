@@ -211,6 +211,16 @@ class _FakeHTTPXStreamResponse:
             raise RuntimeError(f"unexpected status: {self.status_code}")
 
 
+class _FakeHTTPXClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, "kwargs": kwargs})
+        return self.response
+
+
 def _codex_request_kwargs():
     return {
         "model": "gpt-5-codex",
@@ -532,14 +542,110 @@ def test_run_codex_raw_sse_stream_fallback_ignores_empty_event_frames(monkeypatc
             f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
         ]
     )
-
-    with pytest.MonkeyPatch.context() as mp:
-        mp.setattr("httpx.stream", lambda *args, **kwargs: raw_stream)
-        response = agent._run_codex_raw_sse_stream_fallback(_codex_request_kwargs())
+    active_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        _client=_FakeHTTPXClient(raw_stream),
+    )
+    response = agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
 
     assert deltas == ["OK"]
     assert response.status == "completed"
     assert response.output[0].content[0].text == "OK"
+
+
+def test_run_codex_raw_sse_stream_fallback_local_endpoint_uses_base_timeout_for_read(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    captured = {}
+    completed_response = {
+        "id": "resp_local",
+        "status": "completed",
+        "model": "gpt-5.4",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    fake_httpx_client = _FakeHTTPXClient(_FakeHTTPXStreamResponse(
+        [f'data: {json.dumps({"type": "response.completed", "response": completed_response})}']
+    ))
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=fake_httpx_client,
+    )
+
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+
+    agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    captured["timeout"] = fake_httpx_client.calls[0]["kwargs"]["timeout"]
+
+    assert captured["timeout"].read == 1800.0
+
+
+def test_run_codex_raw_sse_stream_fallback_uses_request_local_httpx_client(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    completed_response = {
+        "id": "resp_local_client",
+        "status": "completed",
+        "model": "gpt-5.4",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    fake_httpx_client = _FakeHTTPXClient(
+        _FakeHTTPXStreamResponse(
+            [f'data: {json.dumps({"type": "response.completed", "response": completed_response})}']
+        )
+    )
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=fake_httpx_client,
+    )
+
+    monkeypatch.setattr(
+        "httpx.stream",
+        lambda *args, **kwargs: pytest.fail("raw SSE should reuse the request-local httpx client"),
+    )
+
+    agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    assert len(fake_httpx_client.calls) == 1
+    assert fake_httpx_client.calls[0]["method"] == "POST"
+    assert fake_httpx_client.calls[0]["url"] == "http://localhost:23000/v1/responses"
+
+
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
     monkeypatch.setattr(agent, "_interruptible_api_call", lambda api_kwargs: _codex_message_response("OK"))
