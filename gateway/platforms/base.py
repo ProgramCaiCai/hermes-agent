@@ -1528,6 +1528,28 @@ class BasePlatformAdapter(ABC):
                     logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
                 return
 
+            # /status and /spawn must also bypass the active-session guard so
+            # they always return a system-generated response instead of being
+            # queued as user text and passed to the agent.
+            if cmd in ("status", "spawn"):
+                logger.debug(
+                    "[%s] Command '/%s' bypassing active-session guard for %s",
+                    self.name, cmd, session_key,
+                )
+                try:
+                    _thread_meta = {"thread_id": event.source.thread_id} if event.source.thread_id else None
+                    response = await self._message_handler(event)
+                    if response:
+                        await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=response,
+                            reply_to=event.message_id,
+                            metadata=_thread_meta,
+                        )
+                except Exception as e:
+                    logger.error("[%s] Command '/%s' dispatch failed: %s", self.name, cmd, e, exc_info=True)
+                return
+
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):
