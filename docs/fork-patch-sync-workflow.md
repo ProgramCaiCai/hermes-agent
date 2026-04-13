@@ -17,6 +17,8 @@
 2. 不把长期改动直接堆在 `main`
 3. 所有 fork 定制能力都尽量收敛到 `patch/*`
 4. `main` 可以重建，可以用 `--force-with-lease` 更新
+5. 开发目录与运行目录必须分离
+6. 正式版本只发布到 `~/.hermes/hermes-agent`
 
 ## 一次性认知
 
@@ -155,6 +157,21 @@ git switch -c patch/<topic> original
 - 当前日常开发目录可以保留为 `wip/*`
 - `original`、`patch/*`、`main` 最好各自放在独立 worktree
 - 冲突解决和整合发布优先在干净 worktree 中完成
+
+## 运行与发布约定
+
+- 开发环境与运行环境分离，不直接用开发 worktree 挂生产网关
+- fork 的正式发布目录固定为 `~/.hermes/hermes-agent`
+- 本地网关服务应从 `~/.hermes/hermes-agent` 版本启动
+- 开发 worktree 只用于开发、验证、重建 `main`
+- 验证通过后的正式版本，再同步到 `~/.hermes/hermes-agent`
+
+推荐流程：
+
+1. 在开发 worktree 中完成 patch 更新与 `main` 重建
+2. 在开发 worktree 中完成定向回归验证
+3. 将确认通过的正式版本同步到 `~/.hermes/hermes-agent`
+4. 用 `~/.hermes/hermes-agent` 版本刷新本地 gateway service
 
 ## 本 fork 当前约定
 
