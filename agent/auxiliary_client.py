@@ -1014,7 +1014,10 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
         pass
 
     from agent.anthropic_adapter import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
+    # Native Anthropic auxiliary calls should treat any non-console key as
+    # OAuth/setup-token auth. This mirrors the explicit custom Anthropic path
+    # and preserves bearer-auth behavior for imported OAuth-like tokens.
+    is_oauth = _is_oauth_token(token) or not str(token).startswith("sk-ant-api")
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
@@ -1799,6 +1802,27 @@ def resolve_vision_provider_client(
     if client is None:
         return requested, None, None
     return requested, client, final_model
+
+
+def get_vision_auxiliary_client(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Backward-compatible helper returning only (client, model) for vision."""
+    _, client, final_model = resolve_vision_provider_client(
+        provider,
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+        async_mode=async_mode,
+    )
+    return client, final_model
 
 
 def get_auxiliary_extra_body() -> dict:
