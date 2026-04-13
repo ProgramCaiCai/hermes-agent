@@ -173,6 +173,29 @@ git switch -c patch/<topic> original
 3. 将确认通过的正式版本同步到 `~/.hermes/hermes-agent`
 4. 用 `~/.hermes/hermes-agent` 版本刷新本地 gateway service
 
+## 安装目录同步规则
+
+- `~/.hermes/hermes-agent` 是运行目录，不是开发目录
+- 安装目录默认不保留脏改动；需要保留的内容应先转移到开发目录
+- 安装目录内的 `venv` 需要保留，不随代码同步一起删除
+- 安装目录的正式同步源使用 fork 远端，即 `programcaicai/*`
+
+推荐同步步骤：
+
+```bash
+git fetch programcaicai
+git branch -f original programcaicai/original
+git branch -f patch/runtime-fixes programcaicai/patch/runtime-fixes
+git branch -f patch/custom-api-mode programcaicai/patch/custom-api-mode
+git branch -f patch/spawn-session programcaicai/patch/spawn-session
+git branch -f patch/docs-sync-workflow programcaicai/patch/docs-sync-workflow
+git switch main
+git reset --hard programcaicai/main
+git branch --set-upstream-to=programcaicai/main main
+```
+
+如果需要清理安装目录中的临时文件，只清理代码产物，不删除 `venv`。
+
 ## 本 fork 当前约定
 
 当前长期维护的 patch 分支：
