@@ -55,6 +55,15 @@ def _make_empty_chunk(model=None, usage=None):
     return SimpleNamespace(choices=[], model=model, usage=usage)
 
 
+def _minimal_codex_request_kwargs():
+    return {
+        "model": "gpt-5-codex",
+        "instructions": "You are Hermes.",
+        "input": [{"role": "user", "content": "Ping"}],
+        "store": False,
+    }
+
+
 # ── Test: Streaming Accumulator ──────────────────────────────────────────
 
 
@@ -720,9 +729,11 @@ class TestCodexStreamCallbacks:
         )
 
         mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1"
         mock_client.responses.stream.return_value = mock_stream
+        agent.base_url = mock_client.base_url
 
-        response = agent._run_codex_stream({}, client=mock_client)
+        response = agent._run_codex_stream(_minimal_codex_request_kwargs(), client=mock_client)
         assert "Hello from Codex!" in deltas
 
     def test_codex_stream_refreshes_activity_on_every_event(self):
@@ -787,6 +798,7 @@ class TestCodexStreamCallbacks:
         )
 
         mock_client = MagicMock()
+        mock_client.base_url = "https://api.openai.com/v1"
         mock_client.responses.stream.side_effect = httpx.RemoteProtocolError(
             "peer closed connection without sending complete message body"
         )
@@ -799,12 +811,15 @@ class TestCodexStreamCallbacks:
         )
         agent.api_mode = "codex_responses"
         agent._interrupt_requested = False
+        agent.base_url = mock_client.base_url
+        request_kwargs = _minimal_codex_request_kwargs()
+        expected_kwargs = agent._preflight_codex_api_kwargs(request_kwargs, allow_stream=False)
 
         with patch.object(agent, "_run_codex_create_stream_fallback", return_value=fallback_response) as mock_fallback:
-            response = agent._run_codex_stream({}, client=mock_client)
+            response = agent._run_codex_stream(request_kwargs, client=mock_client)
 
         assert response is fallback_response
-        mock_fallback.assert_called_once_with({}, client=mock_client)
+        mock_fallback.assert_called_once_with(expected_kwargs, client=mock_client)
 
     def test_codex_create_stream_fallback_refreshes_activity_on_every_event(self):
         from run_agent import AIAgent

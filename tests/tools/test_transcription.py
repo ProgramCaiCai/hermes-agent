@@ -6,8 +6,10 @@ dispatch.  All external dependencies (faster_whisper, openai) are mocked.
 
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, mock_open
 
 import pytest
@@ -21,6 +23,14 @@ import pytest
 @pytest.fixture(autouse=True)
 def _clear_openai_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+
+
+def _install_faster_whisper_stub(monkeypatch, whisper_model):
+    monkeypatch.setitem(
+        sys.modules,
+        "faster_whisper",
+        SimpleNamespace(WhisperModel=whisper_model),
+    )
 
 
 class TestGetProvider:
@@ -122,7 +132,7 @@ class TestValidateAudioFile:
 
 class TestTranscribeLocal:
 
-    def test_successful_transcription(self, tmp_path):
+    def test_successful_transcription(self, tmp_path, monkeypatch):
         audio_file = tmp_path / "test.ogg"
         audio_file.write_bytes(b"fake audio")
 
@@ -134,10 +144,12 @@ class TestTranscribeLocal:
 
         mock_model = MagicMock()
         mock_model.transcribe.return_value = ([mock_segment], mock_info)
+        mock_whisper_cls = MagicMock(return_value=mock_model)
+        _install_faster_whisper_stub(monkeypatch, mock_whisper_cls)
 
         with patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), \
-             patch("faster_whisper.WhisperModel", return_value=mock_model), \
-             patch("tools.transcription_tools._local_model", None):
+             patch("tools.transcription_tools._local_model", None), \
+             patch("tools.transcription_tools._local_model_name", None):
             from tools.transcription_tools import _transcribe_local
             result = _transcribe_local(str(audio_file), "base")
 

@@ -29,6 +29,7 @@ import os
 import threading
 import uuid
 from typing import Any, Dict, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -48,6 +49,32 @@ _vnc_url: Optional[str] = None  # cached from /health response
 _vnc_url_checked = False  # only probe once per process
 
 
+def _is_local_camofox_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").strip().lower()
+    except Exception:
+        return False
+    return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
+
+
+def _proxy_bypass_kwargs(url: str) -> Dict[str, Any]:
+    """Bypass host proxies for localhost Camofox servers."""
+    if _is_local_camofox_url(url):
+        # Empty-string proxies are the most reliable way to bypass system/http
+        # proxy discovery in requests for localhost targets.
+        return {"proxies": {"http": "", "https": ""}}
+    return {}
+
+
+def _connection_error_payload() -> str:
+    return json.dumps({
+        "success": False,
+        "error": f"Cannot connect to Camofox at {get_camofox_url()}. "
+                 "Is the server running? Start with: npm start (in camofox-browser dir) "
+                 "or: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser",
+    })
+
+
 def get_camofox_url() -> str:
     """Return the configured Camofox server URL, or empty string."""
     return os.getenv("CAMOFOX_URL", "").rstrip("/")
@@ -65,7 +92,8 @@ def check_camofox_available() -> bool:
     if not url:
         return False
     try:
-        resp = requests.get(f"{url}/health", timeout=5)
+        health_url = f"{url}/health"
+        resp = requests.get(health_url, timeout=5, **_proxy_bypass_kwargs(health_url))
         if resp.status_code == 200 and not _vnc_url_checked:
             try:
                 data = resp.json()
@@ -151,14 +179,16 @@ def _ensure_tab(task_id: Optional[str], url: str = "about:blank") -> Dict[str, A
     if session["tab_id"]:
         return session
     base = get_camofox_url()
+    tabs_url = f"{base}/tabs"
     resp = requests.post(
-        f"{base}/tabs",
+        tabs_url,
         json={
             "userId": session["user_id"],
             "sessionKey": session["session_key"],
             "url": url,
         },
         timeout=_DEFAULT_TIMEOUT,
+        **_proxy_bypass_kwargs(tabs_url),
     )
     resp.raise_for_status()
     data = resp.json()
@@ -196,7 +226,7 @@ def camofox_soft_cleanup(task_id: Optional[str] = None) -> bool:
 def _post(path: str, body: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """POST JSON to camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
-    resp = requests.post(url, json=body, timeout=timeout)
+    resp = requests.post(url, json=body, timeout=timeout, **_proxy_bypass_kwargs(url))
     resp.raise_for_status()
     return resp.json()
 
@@ -204,7 +234,7 @@ def _post(path: str, body: dict, timeout: int = _DEFAULT_TIMEOUT) -> dict:
 def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """GET from camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout)
+    resp = requests.get(url, params=params, timeout=timeout, **_proxy_bypass_kwargs(url))
     resp.raise_for_status()
     return resp.json()
 
@@ -212,7 +242,7 @@ def _get(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dic
 def _get_raw(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> requests.Response:
     """GET from camofox and return raw response (for binary data)."""
     url = f"{get_camofox_url()}{path}"
-    resp = requests.get(url, params=params, timeout=timeout)
+    resp = requests.get(url, params=params, timeout=timeout, **_proxy_bypass_kwargs(url))
     resp.raise_for_status()
     return resp
 
@@ -220,7 +250,7 @@ def _get_raw(path: str, params: dict = None, timeout: int = _DEFAULT_TIMEOUT) ->
 def _delete(path: str, body: dict = None, timeout: int = _DEFAULT_TIMEOUT) -> dict:
     """DELETE to camofox and return parsed response."""
     url = f"{get_camofox_url()}{path}"
-    resp = requests.delete(url, json=body, timeout=timeout)
+    resp = requests.delete(url, json=body, timeout=timeout, **_proxy_bypass_kwargs(url))
     resp.raise_for_status()
     return resp.json()
 
@@ -277,14 +307,15 @@ def camofox_navigate(url: str, task_id: Optional[str] = None) -> str:
 
         return json.dumps(result)
     except requests.HTTPError as e:
+        response = getattr(e, "response", None)
+        if _is_local_camofox_url(get_camofox_url()) and (
+            "Bad Gateway" in str(e)
+            or getattr(response, "status_code", None) in {502, 503, 504}
+        ):
+            return _connection_error_payload()
         return tool_error(f"Navigation failed: {e}", success=False)
     except requests.ConnectionError:
-        return json.dumps({
-            "success": False,
-            "error": f"Cannot connect to Camofox at {get_camofox_url()}. "
-                     "Is the server running? Start with: npm start (in camofox-browser dir) "
-                     "or: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser",
-        })
+        return _connection_error_payload()
     except Exception as e:
         return tool_error(str(e), success=False)
 

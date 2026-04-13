@@ -95,6 +95,12 @@ from agent.context_compressor import ContextCompressor
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.responses_api import (
+    chat_messages_to_responses_input as shared_chat_messages_to_responses_input,
+    deterministic_call_id as shared_deterministic_call_id,
+    normalize_responses_input_items as shared_normalize_responses_input_items,
+    split_responses_tool_id as shared_split_responses_tool_id,
+)
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
     KawaiiSpinner, build_tool_preview as _build_tool_preview,
@@ -1892,6 +1898,37 @@ class AIAgent:
         url = (base_url or self._base_url_lower).lower()
         return "api.openai.com" in url and "openrouter" not in url
 
+    def _is_github_responses_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets GitHub's Responses-compatible API."""
+        url = str(base_url or self._base_url_lower).lower()
+        return "models.github.ai" in url or "api.githubcopilot.com" in url
+
+    def _is_chatgpt_codex_backend_url(self, base_url: str = None) -> bool:
+        """Return True when a base URL targets chatgpt.com's Codex backend."""
+        url = str(base_url or self._base_url_lower).lower()
+        return "chatgpt.com/backend-api/codex" in url
+
+    def _should_prefer_raw_codex_sse(self, base_url: str = None) -> bool:
+        """Use the raw SSE parser as the primary path for custom Responses endpoints.
+
+        OpenAI's Python SDK is strict about SSE framing and rejects some
+        OpenAI-compatible gateways that emit empty event-only frames between
+        `event:` and `data:` lines. Codex avoids this class of bug by owning the
+        byte-stream/SSE parsing path directly; mirror that behavior for
+        non-native Responses endpoints here.
+        """
+        if self.api_mode != "codex_responses":
+            return False
+
+        normalized = str(base_url or self.base_url or self._base_url_lower).lower()
+        if self._is_direct_openai_url(normalized):
+            return False
+        if self._is_github_responses_url(normalized):
+            return False
+        if self._is_chatgpt_codex_backend_url(normalized):
+            return False
+        return True
+
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
         return "openrouter" in self._base_url_lower
@@ -3479,33 +3516,13 @@ class AIAgent:
 
     @staticmethod
     def _deterministic_call_id(fn_name: str, arguments: str, index: int = 0) -> str:
-        """Generate a deterministic call_id from tool call content.
-
-        Used as a fallback when the API doesn't provide a call_id.
-        Deterministic IDs prevent cache invalidation — random UUIDs would
-        make every API call's prefix unique, breaking OpenAI's prompt cache.
-        """
-        import hashlib
-        seed = f"{fn_name}:{arguments}:{index}"
-        digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()[:12]
-        return f"call_{digest}"
+        """Generate a deterministic call_id from tool call content."""
+        return shared_deterministic_call_id(fn_name, arguments, index)
 
     @staticmethod
     def _split_responses_tool_id(raw_id: Any) -> tuple[Optional[str], Optional[str]]:
         """Split a stored tool id into (call_id, response_item_id)."""
-        if not isinstance(raw_id, str):
-            return None, None
-        value = raw_id.strip()
-        if not value:
-            return None, None
-        if "|" in value:
-            call_id, response_item_id = value.split("|", 1)
-            call_id = call_id.strip() or None
-            response_item_id = response_item_id.strip() or None
-            return call_id, response_item_id
-        if value.startswith("fc_"):
-            return None, value
-        return value, None
+        return shared_split_responses_tool_id(raw_id)
 
     def _derive_responses_function_call_id(
         self,
@@ -3538,198 +3555,15 @@ class AIAgent:
 
     def _chat_messages_to_responses_input(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Convert internal chat-style messages to Responses input items."""
-        items: List[Dict[str, Any]] = []
-        seen_item_ids: set = set()
-
-        for msg in messages:
-            if not isinstance(msg, dict):
-                continue
-            role = msg.get("role")
-            if role == "system":
-                continue
-
-            if role in {"user", "assistant"}:
-                content = msg.get("content", "")
-                content_text = str(content) if content is not None else ""
-
-                if role == "assistant":
-                    # Replay encrypted reasoning items from previous turns
-                    # so the API can maintain coherent reasoning chains.
-                    codex_reasoning = msg.get("codex_reasoning_items")
-                    has_codex_reasoning = False
-                    if isinstance(codex_reasoning, list):
-                        for ri in codex_reasoning:
-                            if isinstance(ri, dict) and ri.get("encrypted_content"):
-                                item_id = ri.get("id")
-                                if item_id and item_id in seen_item_ids:
-                                    continue
-                                items.append(ri)
-                                if item_id:
-                                    seen_item_ids.add(item_id)
-                                has_codex_reasoning = True
-
-                    if content_text.strip():
-                        items.append({"role": "assistant", "content": content_text})
-                    elif has_codex_reasoning:
-                        # The Responses API requires a following item after each
-                        # reasoning item (otherwise: missing_following_item error).
-                        # When the assistant produced only reasoning with no visible
-                        # content, emit an empty assistant message as the required
-                        # following item.
-                        items.append({"role": "assistant", "content": ""})
-
-                    tool_calls = msg.get("tool_calls")
-                    if isinstance(tool_calls, list):
-                        for tc in tool_calls:
-                            if not isinstance(tc, dict):
-                                continue
-                            fn = tc.get("function", {})
-                            fn_name = fn.get("name")
-                            if not isinstance(fn_name, str) or not fn_name.strip():
-                                continue
-
-                            embedded_call_id, embedded_response_item_id = self._split_responses_tool_id(
-                                tc.get("id")
-                            )
-                            call_id = tc.get("call_id")
-                            if not isinstance(call_id, str) or not call_id.strip():
-                                call_id = embedded_call_id
-                            if not isinstance(call_id, str) or not call_id.strip():
-                                if (
-                                    isinstance(embedded_response_item_id, str)
-                                    and embedded_response_item_id.startswith("fc_")
-                                    and len(embedded_response_item_id) > len("fc_")
-                                ):
-                                    call_id = f"call_{embedded_response_item_id[len('fc_'):]}"
-                                else:
-                                    _raw_args = str(fn.get("arguments", "{}"))
-                                    call_id = self._deterministic_call_id(fn_name, _raw_args, len(items))
-                            call_id = call_id.strip()
-
-                            arguments = fn.get("arguments", "{}")
-                            if isinstance(arguments, dict):
-                                arguments = json.dumps(arguments, ensure_ascii=False)
-                            elif not isinstance(arguments, str):
-                                arguments = str(arguments)
-                            arguments = arguments.strip() or "{}"
-
-                            items.append({
-                                "type": "function_call",
-                                "call_id": call_id,
-                                "name": fn_name,
-                                "arguments": arguments,
-                            })
-                    continue
-
-                items.append({"role": role, "content": content_text})
-                continue
-
-            if role == "tool":
-                raw_tool_call_id = msg.get("tool_call_id")
-                call_id, _ = self._split_responses_tool_id(raw_tool_call_id)
-                if not isinstance(call_id, str) or not call_id.strip():
-                    if isinstance(raw_tool_call_id, str) and raw_tool_call_id.strip():
-                        call_id = raw_tool_call_id.strip()
-                if not isinstance(call_id, str) or not call_id.strip():
-                    continue
-                items.append({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": str(msg.get("content", "") or ""),
-                })
-
-        return items
+        return shared_chat_messages_to_responses_input(
+            messages,
+            reasoning_items_getter=lambda msg: msg.get("codex_reasoning_items"),
+            split_tool_id=self._split_responses_tool_id,
+            deterministic_id=self._deterministic_call_id,
+        )
 
     def _preflight_codex_input_items(self, raw_items: Any) -> List[Dict[str, Any]]:
-        if not isinstance(raw_items, list):
-            raise ValueError("Codex Responses input must be a list of input items.")
-
-        normalized: List[Dict[str, Any]] = []
-        seen_ids: set = set()
-        for idx, item in enumerate(raw_items):
-            if not isinstance(item, dict):
-                raise ValueError(f"Codex Responses input[{idx}] must be an object.")
-
-            item_type = item.get("type")
-            if item_type == "function_call":
-                call_id = item.get("call_id")
-                name = item.get("name")
-                if not isinstance(call_id, str) or not call_id.strip():
-                    raise ValueError(f"Codex Responses input[{idx}] function_call is missing call_id.")
-                if not isinstance(name, str) or not name.strip():
-                    raise ValueError(f"Codex Responses input[{idx}] function_call is missing name.")
-
-                arguments = item.get("arguments", "{}")
-                if isinstance(arguments, dict):
-                    arguments = json.dumps(arguments, ensure_ascii=False)
-                elif not isinstance(arguments, str):
-                    arguments = str(arguments)
-                arguments = arguments.strip() or "{}"
-
-                normalized.append(
-                    {
-                        "type": "function_call",
-                        "call_id": call_id.strip(),
-                        "name": name.strip(),
-                        "arguments": arguments,
-                    }
-                )
-                continue
-
-            if item_type == "function_call_output":
-                call_id = item.get("call_id")
-                if not isinstance(call_id, str) or not call_id.strip():
-                    raise ValueError(f"Codex Responses input[{idx}] function_call_output is missing call_id.")
-                output = item.get("output", "")
-                if output is None:
-                    output = ""
-                if not isinstance(output, str):
-                    output = str(output)
-
-                normalized.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": call_id.strip(),
-                        "output": output,
-                    }
-                )
-                continue
-
-            if item_type == "reasoning":
-                encrypted = item.get("encrypted_content")
-                if isinstance(encrypted, str) and encrypted:
-                    item_id = item.get("id")
-                    if isinstance(item_id, str) and item_id:
-                        if item_id in seen_ids:
-                            continue
-                        seen_ids.add(item_id)
-                    reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
-                    if isinstance(item_id, str) and item_id:
-                        reasoning_item["id"] = item_id
-                    summary = item.get("summary")
-                    if isinstance(summary, list):
-                        reasoning_item["summary"] = summary
-                    else:
-                        reasoning_item["summary"] = []
-                    normalized.append(reasoning_item)
-                continue
-
-            role = item.get("role")
-            if role in {"user", "assistant"}:
-                content = item.get("content", "")
-                if content is None:
-                    content = ""
-                if not isinstance(content, str):
-                    content = str(content)
-
-                normalized.append({"role": role, "content": content})
-                continue
-
-            raise ValueError(
-                f"Codex Responses input[{idx}] has unsupported item shape (type={item_type!r}, role={role!r})."
-            )
-
-        return normalized
+        return shared_normalize_responses_input_items(raw_items)
 
     def _preflight_codex_api_kwargs(
         self,
@@ -4325,11 +4159,164 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
+    def _coerce_codex_sse_value(self, value: Any) -> Any:
+        """Convert raw SSE JSON payloads into attribute-style objects."""
+        if isinstance(value, dict):
+            return SimpleNamespace(
+                **{k: self._coerce_codex_sse_value(v) for k, v in value.items()}
+            )
+        if isinstance(value, list):
+            return [self._coerce_codex_sse_value(v) for v in value]
+        return value
+
+    def _run_codex_raw_sse_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+    ):
+        """Fallback parser for Responses SSE streams that the SDK rejects.
+
+        Some OpenAI-compatible gateways emit an empty SSE frame between the
+        `event:` and `data:` lines. The OpenAI Python SDK treats that as an
+        event with an empty payload and raises JSONDecodeError. This fallback
+        parses raw `data:` lines directly and ignores blank/event-only frames.
+        """
+        import httpx as _httpx
+
+        active_client = client or self._ensure_primary_openai_client(
+            reason="codex_raw_sse_stream_fallback"
+        )
+        fallback_kwargs = dict(api_kwargs)
+        fallback_kwargs["stream"] = True
+        fallback_kwargs = self._preflight_codex_api_kwargs(fallback_kwargs, allow_stream=True)
+
+        base_url = str(getattr(active_client, "base_url", None) or self.base_url).rstrip("/")
+        api_key = getattr(active_client, "api_key", None) or self.api_key
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream",
+        }
+        default_headers = dict(getattr(self, "_client_kwargs", {}).get("default_headers") or {})
+        for key, value in default_headers.items():
+            if value:
+                headers[key] = value
+
+        base_timeout = float(os.getenv("HERMES_API_TIMEOUT", 1800.0))
+        stream_read_timeout = float(os.getenv("HERMES_STREAM_READ_TIMEOUT", 60.0))
+        if stream_read_timeout == 60.0 and base_url and is_local_endpoint(base_url):
+            stream_read_timeout = base_timeout
+            logger.debug(
+                "Local provider detected (%s) — Codex raw SSE read timeout raised to %.0fs",
+                base_url,
+                stream_read_timeout,
+            )
+        timeout = _httpx.Timeout(
+            connect=30.0,
+            read=stream_read_timeout,
+            write=base_timeout,
+            pool=30.0,
+        )
+
+        terminal_response = None
+        collected_output_items: list = []
+        collected_text_deltas: list = []
+        first_delta_fired = False
+
+        request_httpx_client = getattr(active_client, "_client", None)
+        stream_request = getattr(request_httpx_client, "stream", None)
+        if not callable(stream_request):
+            stream_request = _httpx.stream
+
+        with stream_request(
+            "POST",
+            f"{base_url}/responses",
+            headers=headers,
+            json=fallback_kwargs,
+            timeout=timeout,
+        ) as response:
+            response.raise_for_status()
+            for raw_line in response.iter_lines():
+                if raw_line is None:
+                    continue
+                line = raw_line.decode("utf-8", errors="replace") if isinstance(raw_line, bytes) else str(raw_line)
+                line = line.strip()
+                if not line or not line.startswith("data:"):
+                    continue
+
+                payload = line[5:].strip()
+                if not payload or payload == "[DONE]":
+                    continue
+
+                try:
+                    event = json.loads(payload)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "Skipping malformed raw Codex SSE payload during fallback. %s payload=%r",
+                        self._client_log_context(),
+                        payload[:200],
+                    )
+                    continue
+
+                event_type = event.get("type")
+                if event_type == "response.output_item.done":
+                    done_item = event.get("item")
+                    if done_item is not None:
+                        collected_output_items.append(self._coerce_codex_sse_value(done_item))
+                elif event_type == "response.output_text.delta":
+                    delta = event.get("delta", "")
+                    if delta:
+                        collected_text_deltas.append(delta)
+                        if not first_delta_fired and on_first_delta:
+                            first_delta_fired = True
+                            try:
+                                on_first_delta()
+                            except Exception:
+                                pass
+                        self._fire_stream_delta(delta)
+                elif event_type and "reasoning" in event_type and "delta" in event_type:
+                    reasoning_text = event.get("delta", "")
+                    if reasoning_text:
+                        self._fire_reasoning_delta(reasoning_text)
+                elif event_type in {"response.completed", "response.incomplete", "response.failed"}:
+                    terminal_response = event.get("response")
+
+        if terminal_response is None:
+            raise RuntimeError("Raw SSE fallback did not emit a terminal response.")
+
+        terminal_response = self._coerce_codex_sse_value(terminal_response)
+        _out = getattr(terminal_response, "output", None)
+        if isinstance(_out, list) and not _out:
+            if collected_output_items:
+                terminal_response.output = list(collected_output_items)
+            elif collected_text_deltas:
+                assembled = "".join(collected_text_deltas)
+                terminal_response.output = [SimpleNamespace(
+                    type="message",
+                    role="assistant",
+                    status="completed",
+                    content=[SimpleNamespace(type="output_text", text=assembled)],
+                )]
+        return terminal_response
+
     def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
         """Execute one streaming Responses API request and return the final response."""
         import httpx as _httpx
 
+        api_kwargs = self._preflight_codex_api_kwargs(api_kwargs, allow_stream=False)
         active_client = client or self._ensure_primary_openai_client(reason="codex_stream_direct")
+        active_base_url = str(getattr(active_client, "base_url", None) or self.base_url or "")
+        if self._should_prefer_raw_codex_sse(active_base_url):
+            logger.debug(
+                "Codex Responses stream using raw SSE as primary transport for custom endpoint. %s",
+                self._client_log_context(),
+            )
+            return self._run_codex_raw_sse_stream_fallback(
+                api_kwargs,
+                client=active_client,
+                on_first_delta=on_first_delta,
+            )
         max_stream_retries = 1
         has_tool_calls = False
         first_delta_fired = False
@@ -4429,6 +4416,18 @@ class AIAgent:
                     exc,
                 )
                 return self._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+            except json.JSONDecodeError as exc:
+                logger.debug(
+                    "Codex Responses stream emitted malformed SSE payload; "
+                    "falling back to raw SSE parser. %s error=%s",
+                    self._client_log_context(),
+                    exc,
+                )
+                return self._run_codex_raw_sse_stream_fallback(
+                    api_kwargs,
+                    client=active_client,
+                    on_first_delta=on_first_delta,
+                )
             except RuntimeError as exc:
                 err_text = str(exc)
                 missing_completed = "response.completed" in err_text
@@ -4514,6 +4513,14 @@ class AIAgent:
                                 len(collected_text_deltas), len(assembled),
                             )
                     return terminal_response
+        except json.JSONDecodeError as exc:
+            logger.debug(
+                "Codex create(stream=True) emitted malformed SSE payload; "
+                "falling back to raw SSE parser. %s error=%s",
+                self._client_log_context(),
+                exc,
+            )
+            return self._run_codex_raw_sse_stream_fallback(api_kwargs, client=active_client)
         finally:
             close_fn = getattr(stream_or_response, "close", None)
             if callable(close_fn):
@@ -5624,19 +5631,23 @@ class AIAgent:
             except Exception:
                 pass
 
-            # Determine api_mode from provider / base URL / model
-            fb_api_mode = "chat_completions"
+            # Respect an explicit fallback api_mode when configured; otherwise
+            # infer from provider / base URL like the primary runtime does.
+            explicit_fb_api_mode = str(fb.get("api_mode") or "").strip().lower()
+            if explicit_fb_api_mode in {"chat_completions", "codex_responses", "anthropic_messages"}:
+                fb_api_mode = explicit_fb_api_mode
+            else:
+                fb_api_mode = "chat_completions"
             fb_base_url = str(fb_client.base_url)
-            if fb_provider == "openai-codex":
-                fb_api_mode = "codex_responses"
-            elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
-                fb_api_mode = "anthropic_messages"
-            elif self._is_direct_openai_url(fb_base_url):
-                fb_api_mode = "codex_responses"
-            elif self._model_requires_responses_api(fb_model):
-                # GPT-5.x models need Responses API on every provider
-                # (OpenRouter, Copilot, direct OpenAI, etc.)
-                fb_api_mode = "codex_responses"
+            if explicit_fb_api_mode not in {"chat_completions", "codex_responses", "anthropic_messages"}:
+                if fb_provider == "openai-codex":
+                    fb_api_mode = "codex_responses"
+                elif fb_provider == "anthropic" or fb_base_url.rstrip("/").lower().endswith("/anthropic"):
+                    fb_api_mode = "anthropic_messages"
+                elif self._is_direct_openai_url(fb_base_url):
+                    fb_api_mode = "codex_responses"
+                elif self._model_requires_responses_api(fb_model):
+                    fb_api_mode = "codex_responses"
 
             old_model = self.model
             self.model = fb_model

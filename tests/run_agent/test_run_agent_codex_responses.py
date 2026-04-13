@@ -1,3 +1,4 @@
+import json
 import sys
 import types
 from types import SimpleNamespace
@@ -177,6 +178,47 @@ class _FakeCreateStream:
 
     def close(self):
         self.closed = True
+
+
+class _BrokenSDKStream:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def __iter__(self):
+        raise json.JSONDecodeError("Expecting value", "", 0)
+
+
+class _FakeHTTPXStreamResponse:
+    def __init__(self, lines, *, status_code=200, headers=None):
+        self._lines = list(lines)
+        self.status_code = status_code
+        self.headers = headers or {"content-type": "text/event-stream"}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def iter_lines(self):
+        return iter(self._lines)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"unexpected status: {self.status_code}")
+
+
+class _FakeHTTPXClient:
+    def __init__(self, response):
+        self.response = response
+        self.calls = []
+
+    def stream(self, method, url, **kwargs):
+        self.calls.append({"method": method, "url": url, "kwargs": kwargs})
+        return self.response
 
 
 def _codex_request_kwargs():
@@ -394,6 +436,273 @@ def test_run_codex_stream_fallback_parses_create_stream_events(monkeypatch):
     assert calls["create"] == 1
     assert create_stream.closed is True
     assert response.output[0].content[0].text == "streamed create ok"
+
+def test_run_codex_stream_custom_provider_hydrates_empty_terminal_output(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    monkeypatch.setattr(
+        agent,
+        "_run_codex_raw_sse_stream_fallback",
+        lambda *args, **kwargs: _codex_message_response("custom ok"),
+    )
+
+    response = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(
+            responses=SimpleNamespace(
+                stream=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK stream"),
+            ),
+        ),
+    )
+
+    assert response.output[0].content[0].text == "custom ok"
+
+
+def test_run_codex_stream_falls_back_to_manual_sse_after_sdk_jsondecode_error(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    manual_response = _codex_message_response("manual sse ok")
+    calls = {"manual": 0}
+
+    def _manual_fallback(api_kwargs, client=None, on_first_delta=None):
+        calls["manual"] += 1
+        return manual_response
+
+    monkeypatch.setattr(agent, "_run_codex_raw_sse_stream_fallback", _manual_fallback)
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(
+            stream=lambda **kwargs: _BrokenSDKStream(),
+            create=lambda **kwargs: pytest.fail("should not use SDK create fallback"),
+        )
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["manual"] == 1
+    assert response.output[0].content[0].text == "manual sse ok"
+
+
+def test_run_codex_stream_custom_provider_prefers_raw_sse_primary(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    manual_response = _codex_message_response("raw primary ok")
+    calls = {"manual": 0}
+
+    def _manual_primary(api_kwargs, client=None, on_first_delta=None):
+        calls["manual"] += 1
+        return manual_response
+
+    monkeypatch.setattr(agent, "_run_codex_raw_sse_stream_fallback", _manual_primary)
+
+    response = agent._run_codex_stream(
+        _codex_request_kwargs(),
+        client=SimpleNamespace(
+            responses=SimpleNamespace(
+                stream=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK stream"),
+                create=lambda **kwargs: pytest.fail("custom codex_responses should bypass SDK create"),
+            ),
+        ),
+    )
+
+    assert calls["manual"] == 1
+    assert response.output[0].content[0].text == "raw primary ok"
+
+
+def test_run_codex_raw_sse_stream_fallback_ignores_empty_event_frames(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    deltas = []
+    agent.stream_delta_callback = lambda text: deltas.append(text)
+
+    completed_response = {
+        "id": "resp_test",
+        "status": "completed",
+        "model": "gpt-5-codex",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    output_item = {
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "OK"}],
+    }
+    raw_stream = _FakeHTTPXStreamResponse(
+        [
+            "event: response.created",
+            "",
+            'data: {"type":"response.created","response":{"id":"resp_test","status":"in_progress","model":"gpt-5-codex","output":[]}}',
+            "",
+            'data: {"type":"response.output_text.delta","delta":"OK","item_id":"msg_1","output_index":0,"content_index":0}',
+            "",
+            f'data: {json.dumps({"type": "response.output_item.done", "item": output_item})}',
+            "",
+            f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
+        ]
+    )
+    active_client = SimpleNamespace(
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="codex-token",
+        _client=_FakeHTTPXClient(raw_stream),
+    )
+    response = agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    assert deltas == ["OK"]
+    assert response.status == "completed"
+    assert response.output[0].content[0].text == "OK"
+
+
+def test_run_codex_raw_sse_stream_fallback_local_endpoint_uses_base_timeout_for_read(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    captured = {}
+    completed_response = {
+        "id": "resp_local",
+        "status": "completed",
+        "model": "gpt-5.4",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    fake_httpx_client = _FakeHTTPXClient(_FakeHTTPXStreamResponse(
+        [f'data: {json.dumps({"type": "response.completed", "response": completed_response})}']
+    ))
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=fake_httpx_client,
+    )
+
+    monkeypatch.delenv("HERMES_API_TIMEOUT", raising=False)
+    monkeypatch.delenv("HERMES_STREAM_READ_TIMEOUT", raising=False)
+
+    agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    captured["timeout"] = fake_httpx_client.calls[0]["kwargs"]["timeout"]
+
+    assert captured["timeout"].read == 1800.0
+
+
+def test_run_codex_raw_sse_stream_fallback_uses_request_local_httpx_client(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    completed_response = {
+        "id": "resp_local_client",
+        "status": "completed",
+        "model": "gpt-5.4",
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7},
+    }
+    fake_httpx_client = _FakeHTTPXClient(
+        _FakeHTTPXStreamResponse(
+            [f'data: {json.dumps({"type": "response.completed", "response": completed_response})}']
+        )
+    )
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=fake_httpx_client,
+    )
+
+    monkeypatch.setattr(
+        "httpx.stream",
+        lambda *args, **kwargs: pytest.fail("raw SSE should reuse the request-local httpx client"),
+    )
+
+    agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    assert len(fake_httpx_client.calls) == 1
+    assert fake_httpx_client.calls[0]["method"] == "POST"
+    assert fake_httpx_client.calls[0]["url"] == "http://localhost:23000/v1/responses"
+
+def test_run_codex_stream_custom_provider_hydrates_empty_terminal_output(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    output_item = {
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "custom ok"}],
+    }
+    completed_response = {
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        "status": "completed",
+        "model": "gpt-5.4",
+    }
+    raw_stream = _FakeHTTPXStreamResponse(
+        [
+            f'data: {json.dumps({"type": "response.output_item.done", "item": output_item})}',
+            f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
+        ]
+    )
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=_FakeHTTPXClient(raw_stream),
+    )
+    response = agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    assert response.output[0].content[0].text == "custom ok"
 
 
 def test_run_conversation_codex_plain_text(monkeypatch):
@@ -677,6 +986,21 @@ def test_preflight_codex_api_kwargs_allows_service_tier(monkeypatch):
 
     result = agent._preflight_codex_api_kwargs(kwargs)
     assert result["service_tier"] == "priority"
+
+
+def test_run_codex_stream_rejects_invalid_tool_role_input_without_preflight(monkeypatch):
+    agent = _build_agent(monkeypatch)
+
+    with pytest.raises(ValueError, match="unsupported item shape"):
+        agent._run_codex_stream(
+            {
+                "model": "gpt-5-codex",
+                "instructions": "You are Hermes.",
+                "input": [{"role": "tool", "content": "bad raw tool replay"}],
+                "tools": [],
+                "store": False,
+            }
+        )
 
 
 def test_run_conversation_codex_replay_payload_keeps_call_id(monkeypatch):

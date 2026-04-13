@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 
 from tools.interrupt import set_interrupt, is_interrupted
@@ -20,20 +21,69 @@ def _make_slow_api_response(delay=5.0):
         # Simulate a slow API call
         time.sleep(delay)
         # Return a simple text response (no tool calls)
-        resp = MagicMock()
-        resp.choices = [MagicMock()]
-        resp.choices[0].message = MagicMock()
-        resp.choices[0].message.content = "Done"
-        resp.choices[0].message.tool_calls = None
-        resp.choices[0].message.refusal = None
-        resp.choices[0].finish_reason = "stop"
-        resp.usage = MagicMock()
-        resp.usage.prompt_tokens = 100
-        resp.usage.completion_tokens = 10
-        resp.usage.total_tokens = 110
-        resp.usage.prompt_tokens_details = None
-        return resp
+        return SimpleNamespace(
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="Done",
+                        tool_calls=None,
+                        refusal=None,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=SimpleNamespace(
+                prompt_tokens=100,
+                completion_tokens=10,
+                total_tokens=110,
+                prompt_tokens_details=None,
+            ),
+        )
     return slow_create
+
+
+class _FastContextCompressor:
+    """Lightweight stand-in so the test focuses on interrupt behavior."""
+
+    def __init__(
+        self,
+        model,
+        threshold_percent=0.5,
+        protect_first_n=3,
+        protect_last_n=20,
+        summary_target_ratio=0.2,
+        summary_model_override=None,
+        quiet_mode=True,
+        base_url="",
+        api_key="",
+        config_context_length=None,
+        provider="",
+    ):
+        self.model = model
+        self.threshold_percent = threshold_percent
+        self.protect_first_n = protect_first_n
+        self.protect_last_n = protect_last_n
+        self.summary_target_ratio = summary_target_ratio
+        self.summary_model_override = summary_model_override
+        self.quiet_mode = quiet_mode
+        self.base_url = base_url
+        self.api_key = api_key
+        self.provider = provider
+        self.context_length = config_context_length or 128_000
+        self.threshold_tokens = int(self.context_length * self.threshold_percent)
+        self.last_prompt_tokens = 0
+        self.last_completion_tokens = 0
+        self.last_total_tokens = 0
+        self.compression_count = 0
+        self._context_probed = False
+        self._context_probe_persistable = False
+        self._previous_summary = None
+
+    def compress(self, messages, current_tokens=None):
+        return messages
+
+    def update_from_response(self, usage_dict):
+        return None
 
 
 class TestRealSubagentInterrupt(unittest.TestCase):
@@ -96,7 +146,10 @@ class TestRealSubagentInterrupt(unittest.TestCase):
                     MockOpenAI.return_value = mock_client
 
                     # Patch the instance method so it skips prompt assembly
-                    with patch.object(AIAgent, '_build_system_prompt', return_value="You are a test agent"):
+                    with patch("run_agent.get_tool_definitions", return_value=[]), \
+                         patch("run_agent.check_toolset_requirements", return_value={}), \
+                         patch("run_agent.ContextCompressor", _FastContextCompressor), \
+                         patch.object(AIAgent, '_build_system_prompt', return_value="You are a test agent"):
                         # Signal when child starts
                         original_run = AIAgent.run_conversation
 
@@ -138,7 +191,7 @@ class TestRealSubagentInterrupt(unittest.TestCase):
         agent_thread.start()
 
         # Wait for child to start run_conversation
-        started = child_started.wait(timeout=10)
+        started = child_started.wait(timeout=20)
         if not started:
             agent_thread.join(timeout=1)
             if error_holder[0]:

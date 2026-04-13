@@ -59,6 +59,11 @@ def _make_adapter():
     return adapter
 
 
+@pytest.fixture(autouse=True)
+def _allow_inline_approval_callbacks(monkeypatch):
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "*")
+
+
 # ===========================================================================
 # send_exec_approval — inline keyboard buttons
 # ===========================================================================

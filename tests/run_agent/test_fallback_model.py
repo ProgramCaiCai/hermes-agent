@@ -5,6 +5,7 @@ when the primary fails after retries.
 """
 
 import os
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -215,6 +216,72 @@ class TestTryActivateFallback:
             assert agent.client is mock_client
             assert agent.model == "my-model"
 
+    @pytest.mark.parametrize(
+        ("base_url", "api_mode"),
+        [
+            ("http://localhost:23000/v1", "codex_responses"),
+            ("https://api.openai.com/v1", "chat_completions"),
+            ("http://localhost:23000/v1/anthropic", "anthropic_messages"),
+        ],
+    )
+    def test_custom_fallback_preserves_explicit_api_mode(self, base_url, api_mode):
+        """Custom fallback config must honor explicit api_mode overrides."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "gpt-5.3-codex",
+                "base_url": base_url,
+                "api_mode": api_mode,
+            },
+        )
+        mock_client = _mock_resolve(
+            api_key="custom-secret",
+            base_url=base_url,
+        )
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "agent.auxiliary_client.resolve_provider_client",
+                    return_value=(mock_client, "gpt-5.3-codex"),
+                )
+            )
+            mock_anthropic_client = stack.enter_context(
+                patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock())
+            )
+            stack.enter_context(
+                patch("agent.anthropic_adapter.resolve_anthropic_token", return_value=None)
+            )
+
+            assert agent._try_activate_fallback() is True
+            assert agent.model == "gpt-5.3-codex"
+            assert agent.api_mode == api_mode
+            if api_mode == "anthropic_messages":
+                assert agent.client is None
+                assert agent._anthropic_client is mock_anthropic_client.return_value
+            else:
+                assert agent.client is mock_client
+
+    def test_custom_fallback_invalid_explicit_api_mode_falls_back_to_inference(self):
+        """Invalid api_mode values should not disable provider/base_url inference."""
+        agent = _make_agent(
+            fallback_model={
+                "provider": "custom",
+                "model": "gpt-5.3-codex",
+                "base_url": "http://localhost:23000/v1/anthropic",
+                "api_mode": "not-a-real-mode",
+            },
+        )
+        mock_client = _mock_resolve(
+            api_key="custom-secret",
+            base_url="http://localhost:23000/v1/anthropic",
+        )
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(mock_client, "gpt-5.3-codex"),
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.api_mode == "anthropic_messages"
+
     def test_prompt_caching_enabled_for_claude_on_openrouter(self):
         agent = _make_agent(
             fallback_model={"provider": "openrouter", "model": "anthropic/claude-sonnet-4"},
@@ -394,3 +461,49 @@ class TestProviderCredentials:
             assert agent.client is mock_client
             assert agent.model == "test-model"
             assert agent.provider == provider
+
+
+# =============================================================================
+# switch_model()
+# =============================================================================
+
+class TestSwitchModel:
+    def test_explicit_api_mode_overrides_inference(self):
+        agent = _make_agent(fallback_model=None)
+        replacement_client = MagicMock()
+
+        with (
+            patch.object(agent, "_create_openai_client", return_value=replacement_client) as mock_create,
+            patch("hermes_cli.providers.determine_api_mode", return_value="codex_responses") as mock_determine,
+        ):
+            agent.switch_model(
+                "gpt-5.3-codex",
+                "custom",
+                api_key="custom-secret",
+                base_url="https://api.openai.com/v1",
+                api_mode="chat_completions",
+            )
+
+        mock_determine.assert_not_called()
+        mock_create.assert_called_once()
+        assert agent.api_mode == "chat_completions"
+        assert agent.client is replacement_client
+
+    def test_missing_api_mode_still_uses_inference(self):
+        agent = _make_agent(fallback_model=None)
+        replacement_client = MagicMock()
+
+        with (
+            patch.object(agent, "_create_openai_client", return_value=replacement_client),
+            patch("hermes_cli.providers.determine_api_mode", return_value="codex_responses") as mock_determine,
+        ):
+            agent.switch_model(
+                "gpt-5.3-codex",
+                "custom",
+                api_key="custom-secret",
+                base_url="https://api.openai.com/v1",
+            )
+
+        mock_determine.assert_called_once_with("custom", "https://api.openai.com/v1")
+        assert agent.api_mode == "codex_responses"
+        assert agent.client is replacement_client

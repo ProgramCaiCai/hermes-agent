@@ -50,6 +50,25 @@ class TestSecureWrite:
 
 
 class TestCodeGeneration:
+    def test_store_uses_current_hermes_home_per_instance(self, tmp_path, monkeypatch):
+        home1 = tmp_path / "profile1"
+        home2 = tmp_path / "profile2"
+
+        monkeypatch.setattr("gateway.pairing.PAIRING_DIR", None)
+
+        monkeypatch.setenv("HERMES_HOME", str(home1))
+        store1 = PairingStore()
+        code1 = store1.generate_code("telegram", "user1")
+
+        monkeypatch.setenv("HERMES_HOME", str(home2))
+        store2 = PairingStore()
+        code2 = store2.generate_code("telegram", "user2")
+
+        assert isinstance(code1, str) and len(code1) == CODE_LENGTH
+        assert isinstance(code2, str) and len(code2) == CODE_LENGTH
+        assert store1._rate_limit_path() == home1 / "platforms" / "pairing" / "_rate_limits.json"
+        assert store2._rate_limit_path() == home2 / "platforms" / "pairing" / "_rate_limits.json"
+
     def test_code_format(self, tmp_path):
         with patch("gateway.pairing.PAIRING_DIR", tmp_path):
             store = PairingStore()

@@ -530,6 +530,8 @@ class GatewayRunner:
     _restart_via_service: bool = False
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
+    _running_tasks: Dict[str, asyncio.Task] = {}
+    _session_run_tokens: Dict[str, object] = {}
     
     def __init__(self, config: Optional[GatewayConfig] = None):
         self.config = config or load_gateway_config()
@@ -572,6 +574,8 @@ class GatewayRunner:
         # Key: session_key, Value: AIAgent instance
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
+        self._running_tasks: Dict[str, asyncio.Task] = {}  # active gateway task per session
+        self._session_run_tokens: Dict[str, object] = {}  # run identity per session
         self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
 
         # Cache AIAgent instances per session to preserve prompt caching.
@@ -920,6 +924,40 @@ class GatewayRunner:
                 pass
 
         return model, runtime_kwargs
+
+    def _running_tasks_map(self) -> Dict[str, asyncio.Task]:
+        tasks = self.__dict__.get("_running_tasks")
+        if tasks is None:
+            tasks = {}
+            self._running_tasks = tasks
+        return tasks
+
+    def _session_run_tokens_map(self) -> Dict[str, object]:
+        tokens = self.__dict__.get("_session_run_tokens")
+        if tokens is None:
+            tokens = {}
+            self._session_run_tokens = tokens
+        return tokens
+
+    async def _cancel_session_gateway_task(self, session_key: str) -> bool:
+        """Cancel the active gateway coroutine for a session, if any."""
+        task = self._running_tasks_map().get(session_key)
+        current_task = asyncio.current_task()
+        if task is None or task is current_task or task.done():
+            return False
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug(
+                "Gateway task cleanup for session %s raised %s: %s",
+                session_key[:20],
+                type(exc).__name__,
+                exc,
+            )
+        return True
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
         from agent.smart_model_routing import resolve_turn_route
@@ -2533,12 +2571,15 @@ class GatewayRunner:
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
             # is truly hung — the executor thread is blocked and never checks
-            # _interrupt_requested.  Force-clean _running_agents so the session
-            # is unlocked and subsequent messages are processed normally.
+            # _interrupt_requested.  Cancel the active gateway task, invalidate
+            # its callbacks, and force-clean _running_agents so the session is
+            # unlocked and subsequent messages are processed normally.
             if _cmd_def_inner and _cmd_def_inner.name == "stop":
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
                     running_agent.interrupt("Stop requested")
+                self._session_run_tokens_map().pop(_quick_key, None)
+                await self._cancel_session_gateway_task(_quick_key)
                 # Force-clean: remove the session lock regardless of agent state
                 adapter = self.adapters.get(source.platform)
                 if adapter and hasattr(adapter, 'get_pending_message'):
@@ -2921,6 +2962,11 @@ class GatewayRunner:
         # same session — corrupting the transcript.
         self._running_agents[_quick_key] = _AGENT_PENDING_SENTINEL
         self._running_agents_ts[_quick_key] = time.time()
+        _current_task = asyncio.current_task()
+        if _current_task is not None:
+            self._running_tasks_map()[_quick_key] = _current_task
+        _run_token = object()
+        self._session_run_tokens_map()[_quick_key] = _run_token
 
         try:
             return await self._handle_message_with_agent(event, source, _quick_key)
@@ -2931,6 +2977,10 @@ class GatewayRunner:
             # not linger or the session would be permanently locked out.
             if self._running_agents.get(_quick_key) is _AGENT_PENDING_SENTINEL:
                 del self._running_agents[_quick_key]
+            if self._running_tasks_map().get(_quick_key) is _current_task:
+                self._running_tasks_map().pop(_quick_key, None)
+            if self._session_run_tokens_map().get(_quick_key) is _run_token:
+                self._session_run_tokens_map().pop(_quick_key, None)
             self._running_agents_ts.pop(_quick_key, None)
 
     async def _prepare_inbound_message_text(
@@ -4109,7 +4159,7 @@ class GatewayRunner:
         return "\n".join(lines)
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
-        """Handle /stop command - interrupt a running agent.
+        """Handle /stop command - interrupt and cancel a running agent task.
 
         When an agent is truly hung (blocked thread that never checks
         _interrupt_requested), the early intercept in _handle_message()
@@ -4126,12 +4176,16 @@ class GatewayRunner:
         agent = self._running_agents.get(session_key)
         if agent is _AGENT_PENDING_SENTINEL:
             # Force-clean the sentinel so the session is unlocked.
+            self._session_run_tokens_map().pop(session_key, None)
+            await self._cancel_session_gateway_task(session_key)
             if session_key in self._running_agents:
                 del self._running_agents[session_key]
             logger.info("STOP (pending) for session %s — sentinel cleared", session_key[:20])
             return "⚡ Stopped. The agent hadn't started yet — you can continue this session."
         if agent:
             agent.interrupt("Stop requested")
+            self._session_run_tokens_map().pop(session_key, None)
+            await self._cancel_session_gateway_task(session_key)
             # Force-clean the session lock so a truly hung agent doesn't
             # keep it locked forever.
             if session_key in self._running_agents:
@@ -7423,6 +7477,22 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        run_token = self._session_run_tokens_map().get(session_key)
+
+        def _run_is_active() -> bool:
+            if not session_key:
+                return True
+            return self._session_run_tokens_map().get(session_key) is run_token
+
+        def _cancelled_run_response() -> Dict[str, Any]:
+            return {
+                "final_response": None,
+                "messages": [],
+                "api_calls": 0,
+                "tools": [],
+                "completed": False,
+                "interrupted": True,
+            }
 
         display_config = user_config.get("display", {})
         if not isinstance(display_config, dict):
@@ -7471,7 +7541,7 @@ class GatewayRunner:
         
         def progress_callback(event_type: str, tool_name: str = None, preview: str = None, args: dict = None, **kwargs):
             """Callback invoked by agent on tool lifecycle events."""
-            if not progress_queue:
+            if not progress_queue or not _run_is_active():
                 return
 
             # Only act on tool.started events (ignore tool.completed, reasoning.available, etc.)
@@ -7575,6 +7645,8 @@ class GatewayRunner:
             _PROGRESS_EDIT_INTERVAL = 1.5  # Minimum seconds between edits
 
             while True:
+                if not _run_is_active():
+                    return
                 try:
                     raw = progress_queue.get_nowait()
 
@@ -7680,6 +7752,8 @@ class GatewayRunner:
         _hooks_ref = self.hooks
 
         def _step_callback_sync(iteration: int, prev_tools: list) -> None:
+            if not _run_is_active():
+                return
             try:
                 # prev_tools may be list[str] or list[dict] with "name"/"result"
                 # keys.  Normalise to keep "tool_names" backward-compatible for
@@ -7710,7 +7784,7 @@ class GatewayRunner:
         _status_thread_metadata = {"thread_id": _progress_thread_id} if _progress_thread_id else None
 
         def _status_callback_sync(event_type: str, message: str) -> None:
-            if not _status_adapter:
+            if not _status_adapter or not _run_is_active():
                 return
             try:
                 asyncio.run_coroutine_threadsafe(
@@ -7736,6 +7810,9 @@ class GatewayRunner:
             # session_key is now set via contextvars in _set_session_env()
             # (concurrency-safe). Keep os.environ as fallback for CLI/cron.
             os.environ["HERMES_SESSION_KEY"] = session_key or ""
+
+            if not _run_is_active():
+                return _cancelled_run_response()
 
             # Read from env var or use default (same as CLI)
             max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
@@ -7833,7 +7910,11 @@ class GatewayRunner:
                             metadata={"thread_id": _progress_thread_id} if _progress_thread_id else None,
                         )
                         if _want_stream_deltas:
-                            _stream_delta_cb = _stream_consumer.on_delta
+                            def _guarded_stream_delta(delta: str) -> None:
+                                if _run_is_active():
+                                    _stream_consumer.on_delta(delta)
+
+                            _stream_delta_cb = _guarded_stream_delta
                         stream_consumer_holder[0] = _stream_consumer
                 except Exception as _sc_err:
                     logger.debug("Could not set up stream consumer: %s", _sc_err)
@@ -7924,7 +8005,7 @@ class GatewayRunner:
 
             # Background review delivery — send "💾 Memory updated" etc. to user
             def _bg_review_send(message: str) -> None:
-                if not _status_adapter:
+                if not _status_adapter or not _run_is_active():
                     return
                 try:
                     asyncio.run_coroutine_threadsafe(
@@ -7942,6 +8023,12 @@ class GatewayRunner:
 
             # Store agent reference for interrupt support
             agent_holder[0] = agent
+            if not _run_is_active():
+                try:
+                    agent.interrupt("Session stopped")
+                except Exception:
+                    pass
+                return _cancelled_run_response()
             # Capture the full tool definitions for transcript logging
             tools_holder[0] = agent.tools if hasattr(agent, 'tools') else None
             
@@ -8235,6 +8322,8 @@ class GatewayRunner:
         async def _start_stream_consumer():
             """Wait for the stream consumer to be created, then run it."""
             for _ in range(200):  # Up to 10s wait
+                if not _run_is_active():
+                    return
                 if stream_consumer_holder[0] is not None:
                     await stream_consumer_holder[0].run()
                     return
@@ -8247,8 +8336,10 @@ class GatewayRunner:
         async def track_agent():
             # Wait for agent to be created
             while agent_holder[0] is None:
+                if not _run_is_active():
+                    return
                 await asyncio.sleep(0.05)
-            if session_key:
+            if session_key and _run_is_active():
                 self._running_agents[session_key] = agent_holder[0]
                 if self._draining:
                     self._update_runtime_status("draining")
@@ -8268,6 +8359,8 @@ class GatewayRunner:
                 return
 
             while True:
+                if not _run_is_active():
+                    return
                 await asyncio.sleep(0.2)  # Check every 200ms
                 try:
                     # Re-resolve adapter each iteration so reconnects don't
@@ -8319,6 +8412,8 @@ class GatewayRunner:
             if not _notify_adapter:
                 return
             while True:
+                if not _run_is_active():
+                    return
                 await asyncio.sleep(_NOTIFY_INTERVAL)
                 _elapsed_mins = int((time.time() - _notify_start) // 60)
                 # Include agent activity context if available.
