@@ -119,6 +119,7 @@ def chat_messages_to_responses_input(
     deterministic_id: Callable[[str, str, int], str] = deterministic_call_id,
 ) -> List[Dict[str, Any]]:
     items: List[Dict[str, Any]] = []
+    seen_reasoning_ids: set[str] = set()
 
     for msg in messages:
         if not isinstance(msg, dict):
@@ -136,6 +137,11 @@ def chat_messages_to_responses_input(
                 if reasoning_items_getter is not None:
                     for ri in reasoning_items_getter(msg) or []:
                         if isinstance(ri, dict) and ri.get("encrypted_content"):
+                            reasoning_id = ri.get("id")
+                            if isinstance(reasoning_id, str) and reasoning_id:
+                                if reasoning_id in seen_reasoning_ids:
+                                    continue
+                                seen_reasoning_ids.add(reasoning_id)
                             items.append(ri)
                             has_reasoning = True
 
@@ -286,6 +292,7 @@ def normalize_responses_input_items(raw_items: Any) -> List[Dict[str, Any]]:
         raise ValueError("Codex Responses input must be a list of input items.")
 
     normalized: List[Dict[str, Any]] = []
+    seen_reasoning_ids: set[str] = set()
     for idx, item in enumerate(raw_items):
         if not isinstance(item, dict):
             raise ValueError(f"Codex Responses input[{idx}] must be an object.")
@@ -335,6 +342,9 @@ def normalize_responses_input_items(raw_items: Any) -> List[Dict[str, Any]]:
                 reasoning_item = {"type": "reasoning", "encrypted_content": encrypted}
                 item_id = item.get("id")
                 if isinstance(item_id, str) and item_id:
+                    if item_id in seen_reasoning_ids:
+                        continue
+                    seen_reasoning_ids.add(item_id)
                     reasoning_item["id"] = item_id
                 summary = item.get("summary")
                 reasoning_item["summary"] = summary if isinstance(summary, list) else []

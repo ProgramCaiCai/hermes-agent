@@ -645,6 +645,49 @@ def test_run_codex_raw_sse_stream_fallback_uses_request_local_httpx_client(monke
     assert fake_httpx_client.calls[0]["method"] == "POST"
     assert fake_httpx_client.calls[0]["url"] == "http://localhost:23000/v1/responses"
 
+def test_run_codex_stream_custom_provider_hydrates_empty_terminal_output(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5.4",
+        provider="custom",
+        api_mode="codex_responses",
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        quiet_mode=True,
+        max_iterations=4,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    output_item = {
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "custom ok"}],
+    }
+    completed_response = {
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        "status": "completed",
+        "model": "gpt-5.4",
+    }
+    raw_stream = _FakeHTTPXStreamResponse(
+        [
+            f'data: {json.dumps({"type": "response.output_item.done", "item": output_item})}',
+            f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
+        ]
+    )
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=_FakeHTTPXClient(raw_stream),
+    )
+    response = agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
+
+    assert response.output[0].content[0].text == "custom ok"
+
 
 def test_run_conversation_codex_plain_text(monkeypatch):
     agent = _build_agent(monkeypatch)
