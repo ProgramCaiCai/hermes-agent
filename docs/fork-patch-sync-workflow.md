@@ -8,6 +8,7 @@
 - `patch/runtime-fixes`：运行时与兼容性补丁
 - `patch/custom-api-mode`：自定义 provider / `api_mode` 补丁
 - `patch/spawn-session`：`/spawn` 会话补丁
+- `patch/docs-sync-workflow`：fork 维护文档与同步流程约定
 - `main`：发布用整合分支，只承载 `original + patch/*` 的合成结果
 
 原则：
@@ -46,11 +47,21 @@ git push fork original
 
 建议每次同步都新起一个临时整合分支，不直接在旧 `main` 上硬 merge。
 
+当前固定合并顺序：
+
+1. `patch/runtime-fixes`
+2. `patch/custom-api-mode`
+3. `patch/spawn-session`
+4. `patch/docs-sync-workflow`
+
+这四个 patch 以后按上面顺序合并，不临时改顺序。
+
 ```bash
 git switch -C rebuild/main-$(date +%Y%m%d) original
 git merge --no-ff patch/runtime-fixes -m "merge(patch): integrate runtime fixes"
 git merge --no-ff patch/custom-api-mode -m "merge(patch): integrate custom api mode"
 git merge --no-ff patch/spawn-session -m "merge(patch): integrate spawn session"
+git merge --no-ff patch/docs-sync-workflow -m "merge(patch): integrate docs sync workflow"
 ```
 
 如果以后增加新的 patch，就继续按固定顺序往下 merge。
@@ -152,6 +163,7 @@ git switch -c patch/<topic> original
 - `patch/runtime-fixes`
 - `patch/custom-api-mode`
 - `patch/spawn-session`
+- `patch/docs-sync-workflow`
 
 当前不纳入 patch 体系的本地临时改动：
 
