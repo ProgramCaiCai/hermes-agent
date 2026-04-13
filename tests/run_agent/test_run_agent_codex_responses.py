@@ -403,29 +403,33 @@ def test_run_codex_stream_custom_provider_hydrates_empty_terminal_output(monkeyp
         skip_context_files=True,
         skip_memory=True,
     )
-    stream = _FakeResponsesStream(
-        events=[
-            SimpleNamespace(
-                type="response.output_item.done",
-                item=SimpleNamespace(
-                    type="message",
-                    status="completed",
-                    content=[SimpleNamespace(type="output_text", text="custom ok")],
-                    phase="final_answer",
-                    role="assistant",
-                ),
-            ),
-            SimpleNamespace(
-                type="response.completed",
-                response=_custom_responses_empty_terminal(),
-            ),
-        ],
-        final_response=_custom_responses_empty_terminal(),
+    output_item = {
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": "custom ok"}],
+    }
+    completed_response = {
+        "output": [],
+        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8},
+        "status": "completed",
+        "model": "gpt-5.4",
+    }
+    raw_stream = _FakeHTTPXStreamResponse(
+        [
+            f'data: {json.dumps({"type": "response.output_item.done", "item": output_item})}',
+            f'data: {json.dumps({"type": "response.completed", "response": completed_response})}',
+        ]
     )
-
-    response = agent._run_codex_stream(_codex_request_kwargs(), client=SimpleNamespace(
-        responses=SimpleNamespace(stream=lambda **kwargs: stream),
-    ))
+    active_client = SimpleNamespace(
+        base_url="http://localhost:23000/v1",
+        api_key="test-key",
+        _client=_FakeHTTPXClient(raw_stream),
+    )
+    response = agent._run_codex_raw_sse_stream_fallback(
+        _codex_request_kwargs(),
+        client=active_client,
+    )
 
     assert response.output[0].content[0].text == "custom ok"
 
