@@ -872,6 +872,22 @@ def _try_custom_endpoint() -> Tuple[Optional[OpenAI], Optional[str]]:
     if custom_mode == "codex_responses":
         real_client = OpenAI(api_key=custom_key, base_url=custom_base)
         return CodexAuxiliaryClient(real_client, model), model
+    if custom_mode == "anthropic_messages":
+        try:
+            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+        except ImportError:
+            return None, None
+        real_client = build_anthropic_client(custom_key, custom_base)
+        return (
+            AnthropicAuxiliaryClient(
+                real_client,
+                model,
+                custom_key,
+                custom_base,
+                is_oauth=_is_oauth_token(custom_key) or not str(custom_key).startswith("sk-ant-api"),
+            ),
+            model,
+        )
     return OpenAI(api_key=custom_key, base_url=custom_base), model
 
 
@@ -931,7 +947,10 @@ def _try_anthropic() -> Tuple[Optional[Any], Optional[str]]:
         pass
 
     from agent.anthropic_adapter import _is_oauth_token
-    is_oauth = _is_oauth_token(token)
+    # Native Anthropic auxiliary calls should treat any non-console key as
+    # OAuth/setup-token auth. This mirrors the explicit custom Anthropic path
+    # and preserves bearer-auth behavior for imported OAuth-like tokens.
+    is_oauth = _is_oauth_token(token) or not str(token).startswith("sk-ant-api")
     model = _API_KEY_PROVIDER_AUX_MODELS.get("anthropic", "claude-haiku-4-5-20251001")
     logger.debug("Auxiliary client: Anthropic native (%s) at %s (oauth=%s)", model, base_url, is_oauth)
     try:
@@ -1375,6 +1394,21 @@ def resolve_provider_client(
                 model or _read_main_model() or "gpt-4o-mini",
                 provider,
             )
+            if api_mode == "anthropic_messages":
+                try:
+                    from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+                except ImportError:
+                    return None, None
+                real_client = build_anthropic_client(custom_key, custom_base)
+                client = AnthropicAuxiliaryClient(
+                    real_client,
+                    final_model,
+                    custom_key,
+                    custom_base,
+                    is_oauth=_is_oauth_token(custom_key) or not str(custom_key).startswith("sk-ant-api"),
+                )
+                return (_to_async_client(client, final_model) if async_mode
+                        else (client, final_model))
             extra = {}
             if "api.kimi.com" in custom_base.lower():
                 extra["default_headers"] = {"User-Agent": "KimiCLI/1.30.0"}
@@ -1666,6 +1700,7 @@ def resolve_vision_provider_client(
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
     async_mode: bool = False,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
@@ -1676,7 +1711,7 @@ def resolve_vision_provider_client(
     stays conservative and only tries vision backends known to work today.
     """
     requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
+        "vision", provider, model, base_url, api_key, api_mode
     )
     requested = _normalize_vision_provider(requested)
 
@@ -1751,6 +1786,27 @@ def resolve_vision_provider_client(
     if client is None:
         return requested, None, None
     return requested, client, final_model
+
+
+def get_vision_auxiliary_client(
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    api_mode: Optional[str] = None,
+    async_mode: bool = False,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """Backward-compatible helper returning only (client, model) for vision."""
+    _, client, final_model = resolve_vision_provider_client(
+        provider,
+        model,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+        async_mode=async_mode,
+    )
+    return client, final_model
 
 
 def get_auxiliary_extra_body() -> dict:
@@ -1991,6 +2047,7 @@ def _resolve_task_provider_model(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    api_mode: str = None,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -2028,8 +2085,23 @@ def _resolve_task_provider_model(
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
-    resolved_model = model or cfg_model
-    resolved_api_mode = cfg_api_mode
+        # Backwards compat: compression section has its own keys.
+        # The auxiliary.compression defaults to provider="auto", so treat
+        # both None and "auto" as "not explicitly configured".
+        if task == "compression" and (not cfg_provider or cfg_provider == "auto"):
+            comp = config.get("compression", {}) if isinstance(config, dict) else {}
+            if isinstance(comp, dict):
+                cfg_provider = comp.get("summary_provider", "").strip() or None
+                cfg_model = cfg_model or comp.get("summary_model", "").strip() or None
+                _sbu = comp.get("summary_base_url") or ""
+                cfg_base_url = cfg_base_url or _sbu.strip() or None
+                cfg_api_mode = cfg_api_mode or str(comp.get("summary_api_mode", "")).strip() or None
+
+    # Env vars are backward-compat fallback only — config.yaml is primary.
+    env_model = _get_auxiliary_env_override(task, "MODEL") if task else None
+    env_api_mode = _get_auxiliary_env_override(task, "API_MODE") if task else None
+    resolved_model = model or cfg_model or env_model
+    resolved_api_mode = api_mode or cfg_api_mode or env_api_mode
 
     if base_url:
         return "custom", resolved_model, base_url, api_key, resolved_api_mode
