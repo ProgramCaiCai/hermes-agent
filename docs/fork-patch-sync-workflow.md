@@ -7,8 +7,8 @@
 - `original`：严格对齐官方上游，只允许 `ff-only`
 - `rebuild/main-*`：每次同步时从最新 `original` 新建的语义重建分支
 - `main`：当前发布分支，是可重建产物，不是补丁真源
-- `patch/runtime-fixes`：运行时语义所有权分支；只保留仍未被 upstream 吸收的运行时差异
-- `patch/custom-api-mode`：`api_mode` 语义所有权分支；当前主要承担回归监控职责
+- `archive/runtime-fixes`：已归档的运行时补丁分支，仅保留历史参考，不参与默认同步
+- `archive/custom-api-mode`：已归档的 `api_mode` 补丁分支，仅保留历史参考，不参与默认同步
 - `patch/spawn-session`：`/spawn` 语义所有权分支；当前仍是活跃 fork 能力
 - `patch/docs-sync-workflow`：fork 治理与同步规则分支
 
@@ -59,8 +59,8 @@ git switch -C rebuild/main-$(date +%Y%m%d) original
 
 当前基线结论：
 
-- `patch/runtime-fixes`：已被 upstream 大体吸收，默认只做回归验证
-- `patch/custom-api-mode`：已被 upstream 大体吸收，默认只做回归验证
+- `archive/runtime-fixes`：已被 upstream 大体吸收，作为归档分支保留
+- `archive/custom-api-mode`：已被 upstream 大体吸收，作为归档分支保留
 - `patch/spawn-session`：仍需保留，当前 rebuild 已重建完整 `/spawn`
 - `patch/docs-sync-workflow`：继续保留，负责维护本治理文档
 
@@ -69,13 +69,11 @@ git switch -C rebuild/main-$(date +%Y%m%d) original
 不要默认执行：
 
 ```bash
-git merge --no-ff patch/runtime-fixes
-git merge --no-ff patch/custom-api-mode
 git merge --no-ff patch/spawn-session
 git merge --no-ff patch/docs-sync-workflow
 ```
 
-这些命令不再是默认流程。只有在明确确认“某个 patch 仍以文本方式最小且正确”时，才允许局部参考其实现；默认做法是直接在 `rebuild/main-*` 上按当前架构重实现缺口语义。
+这些命令也不是默认流程，只是说明当前仍活跃的 patch 分支范围。`archive/*` 不参与默认同步；默认做法仍然是直接在 `rebuild/main-*` 上按当前架构重实现缺口语义。
 
 ### 5. 做定向验证
 
@@ -115,17 +113,17 @@ git push --force-with-lease fork main
 
 ## patch 分支治理规则
 
-### `patch/runtime-fixes`
+### `archive/runtime-fixes`
 
-- 默认目标：持续收缩
-- 只有当定向回归失败且 upstream 未吸收时，才保留代码差异
-- 如果长期无缺口，可冻结为文档/测试语义，甚至删除
+- 默认目标：历史归档
+- 不再作为活跃 patch 参与同步
+- 只有在确认需要“复活”为活跃差异时，才重新拆出新的 patch 分支
 
-### `patch/custom-api-mode`
+### `archive/custom-api-mode`
 
-- 默认目标：降级为回归监控分支
-- 当前不应再承载大块实现补丁
-- 只有发现新的 `api_mode` 真实回归时，才恢复最小代码差异
+- 默认目标：历史归档
+- 不再作为活跃 patch 参与同步
+- 如果未来出现新的 `api_mode` 回归，应新建新的 patch 分支，而不是直接恢复 archive 分支
 
 ### `patch/spawn-session`
 
@@ -158,5 +156,5 @@ git push --force-with-lease fork main
 
 - 语义重建分支：`rebuild/main-20260419-semantic`
 - 当前确认需保留的活跃 fork 语义：`/spawn`
-- 当前确认已被 upstream 吸收的语义：`runtime-fixes`、`custom-api-mode`
+- 当前确认已归档的吸收语义：`archive/runtime-fixes`、`archive/custom-api-mode`
 - 当前治理分支：`patch/docs-sync-workflow`

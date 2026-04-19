@@ -345,9 +345,10 @@ This fork now uses **semantic sync** as the default maintenance path.
 - Update `original` first, then create a clean `rebuild/main-*` branch from the latest `original`.
 - Re-implement or verify only the fork semantics still missing upstream.
 - Keep `patch/*` branches as semantic ownership branches:
-  - `patch/runtime-fixes` and `patch/custom-api-mode` are validation-first and should shrink as upstream absorbs them.
   - `patch/spawn-session` owns the remaining live `/spawn` fork behavior.
   - `patch/docs-sync-workflow` owns this governance policy.
+- Keep absorbed branches archived instead of treating them as active sync inputs:
+  - `archive/runtime-fixes` and `archive/custom-api-mode` are historical reference branches only.
 - Any proposal to return to mechanical patch merges must be treated as an exception and justified explicitly; it is no longer the default workflow.
 
 ### Prompt Caching Must Not Break
