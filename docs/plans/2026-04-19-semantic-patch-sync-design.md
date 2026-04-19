@@ -4,8 +4,8 @@
 
 fork 之前依赖固定顺序的机械合并：
 
-- `patch/runtime-fixes`
-- `patch/custom-api-mode`
+- `archive/runtime-fixes`
+- `archive/custom-api-mode`
 - `patch/spawn-session`
 - `patch/docs-sync-workflow`
 
@@ -21,7 +21,7 @@ fork 之前依赖固定顺序的机械合并：
 
 ## 已验证的语义盘点
 
-### `patch/runtime-fixes`
+### `archive/runtime-fixes`
 
 原始意图：
 
@@ -44,7 +44,7 @@ fork 之前依赖固定顺序的机械合并：
 - rebuild 分支不需要回放旧实现。
 - 后续只在出现新的定向失败时，按失败点最小补洞。
 
-### `patch/custom-api-mode`
+### `archive/custom-api-mode`
 
 原始意图：
 
@@ -106,7 +106,7 @@ fork 之前依赖固定顺序的机械合并：
 
 1. `rebuild/main-20260419-semantic` 基于干净 `original@957ca79e`
 2. 只保留仍缺失的 `/spawn` 语义
-3. `runtime-fixes` 与 `custom-api-mode` 以验证为主，不再机械重放
+3. `archive/runtime-fixes` 与 `archive/custom-api-mode` 仅作为已吸收语义的归档参考保留
 4. `docs/fork-patch-sync-workflow.md` 成为语义同步的正式工作流文档
 5. `patch/*` 分支不再被视为固定顺序 merge 的文本差异集合
 

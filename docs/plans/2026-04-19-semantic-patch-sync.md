@@ -4,12 +4,12 @@
 
 - Workspace: `rebuild/main-20260419-semantic` is a clean rebuild branch on top of `original@957ca79e`
 - `/spawn` semantic restore: implemented and verified by `tests/gateway/test_spawn_command.py` (`10 passed`)
-- `patch/runtime-fixes`: treated as absorbed after targeted verification
+- `archive/runtime-fixes`: treated as absorbed after targeted verification and archived
   - `tests/run_agent/test_run_agent_codex_responses.py` (`44 passed`)
   - `tests/gateway/test_session_race_guard.py` (`16 passed`)
   - `tests/gateway/test_api_server.py` (`114 passed`)
   - `tests/gateway/test_telegram_network.py` (`45 passed`)
-- `patch/custom-api-mode`: treated as absorbed after targeted verification
+- `archive/custom-api-mode`: treated as absorbed after targeted verification and archived
   - `tests/hermes_cli/test_model_provider_persistence.py` (`10 passed`)
   - `tests/hermes_cli/test_runtime_provider_resolution.py` (`67 passed`)
   - `tests/agent/test_auxiliary_client.py` (`71 passed`)
@@ -18,7 +18,7 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Rebuild the fork on top of `original@957ca79e` by preserving only the still-needed semantics from `patch/runtime-fixes`, `patch/custom-api-mode`, `patch/spawn-session`, and `patch/docs-sync-workflow`.
+**Goal:** Rebuild the fork on top of `original@957ca79e` by preserving only the still-needed semantics from the absorbed archived branches plus the active `patch/spawn-session` and `patch/docs-sync-workflow` branches.
 
 **Architecture:** Use a fresh `rebuild/main-20260419-semantic` worktree as the sole implementation target. Treat patch branches as behavior references only. Re-add missing semantics with focused tests, then rewrite sync documentation so future maintenance uses semantic inventory + verification instead of ordered mechanical merges.
 
@@ -216,17 +216,17 @@ Record:
 **Files:**
 - Modify: `docs/fork-patch-sync-workflow.md`
 - Potential follow-up branch operations on:
-  - `patch/runtime-fixes`
-  - `patch/custom-api-mode`
+  - `archive/runtime-fixes`
+  - `archive/custom-api-mode`
   - `patch/spawn-session`
   - `patch/docs-sync-workflow`
 
 **Step 1: Define the follow-up branch policy**
 
 State explicitly:
-- `patch/custom-api-mode` is likely absorbed and should be reduced to documentation or deleted after confirmation
+- `archive/custom-api-mode` is absorbed and should stay archived unless a future regression requires a new active patch branch
 - `patch/spawn-session` remains a living semantic branch until upstream fully exposes/tests `/spawn`
-- `patch/runtime-fixes` should be reduced to only the runtime semantics still missing upstream
+- `archive/runtime-fixes` is absorbed and should stay archived unless a future regression requires a new active patch branch
 - `patch/docs-sync-workflow` owns the semantic maintenance policy
 
 **Step 2: Do not treat historical cherry-picks as sacred**
