@@ -3230,10 +3230,12 @@ class GatewayRunner:
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
                 return await self._handle_agents_command(event)
 
-            # /background must bypass the running-agent guard — it starts a
-            # parallel task and must never interrupt the active conversation.
+            # /background and /spawn must bypass the running-agent guard — they
+            # start parallel tasks and must never interrupt the active conversation.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
                 return await self._handle_background_command(event)
+            if _cmd_def_inner and _cmd_def_inner.name == "spawn":
+                return await self._handle_spawn_command(event)
 
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
@@ -3457,6 +3459,9 @@ class GatewayRunner:
 
         if canonical == "branch":
             return await self._handle_branch_command(event)
+
+        if canonical == "spawn":
+            return await self._handle_spawn_command(event)
 
         if canonical == "rollback":
             return await self._handle_rollback_command(event)
@@ -6270,6 +6275,143 @@ class GatewayRunner:
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
         return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
 
+    async def _handle_spawn_command(self, event: MessageEvent) -> str:
+        """Handle /spawn <prompt> — clone the current session and run a child task."""
+        prompt = event.get_command_args().strip()
+        if not prompt:
+            return (
+                "Usage: /spawn <prompt>\n"
+                "Example: /spawn Continue this research in the background\n\n"
+                "Clones the current session, keeps you here, and runs the prompt in the child session."
+            )
+
+        if not self._session_db:
+            return "Session database not available."
+
+        source = event.source
+        current_entry = self.session_store.get_or_create_session(source)
+        session_key = self._session_key_for_source(source)
+        running_agent = self._running_agents.get(session_key)
+        if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
+            history = list(getattr(running_agent, "_session_messages", []) or [])
+        else:
+            history = []
+        if not history:
+            history = self.session_store.load_transcript(current_entry.session_id)
+        if not history:
+            return "No conversation to spawn from — send a message first."
+
+        now = datetime.now()
+        task_id = f"spawn_{now.strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        new_session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{os.urandom(3).hex()}"
+        current_title = self._session_db.get_session_title(current_entry.session_id)
+        child_title = self._session_db.get_next_title_in_lineage(current_title or "spawn")
+
+        try:
+            self._session_db.clone_session(
+                source_session_id=current_entry.session_id,
+                new_session_id=new_session_id,
+                source=source.platform.value if source.platform else "gateway",
+                model=(self.config.get("model", {}) or {}).get("default")
+                if isinstance(self.config, dict)
+                else None,
+                user_id=source.user_id,
+                parent_session_id=current_entry.session_id,
+                title=child_title,
+                messages=history,
+            )
+        except Exception as e:
+            logger.error("Failed to create spawn session: %s", e)
+            return f"Failed to create spawn session: {e}"
+
+        _task = asyncio.create_task(
+            self._run_spawn_task(
+                prompt,
+                source,
+                task_id,
+                new_session_id,
+                history,
+                parent_session_id=current_entry.session_id,
+            )
+        )
+        self._background_tasks.add(_task)
+        _task.add_done_callback(self._background_tasks.discard)
+
+        preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+        return (
+            f'🪄 Spawn task started: "{preview}"\n'
+            f"Task ID: {task_id}\n"
+            f"Parent session: {current_entry.session_id}\n"
+            f"Child session: {new_session_id}\n"
+            "You stay on the current session — results will appear here when done."
+        )
+
+    def _persist_spawn_result_to_parent(
+        self,
+        parent_session_id: str | None,
+        content: str,
+    ) -> None:
+        """Append the final /spawn result to the parent session transcript."""
+        if not parent_session_id or not content:
+            return
+        try:
+            self.session_store.append_to_transcript(
+                parent_session_id,
+                {
+                    "role": "assistant",
+                    "content": content,
+                    "timestamp": datetime.now().isoformat(),
+                    "mirror": True,
+                    "mirror_source": "spawn",
+                },
+            )
+        except Exception as exc:
+            logger.debug(
+                "Failed to persist /spawn result to parent session %s: %s",
+                parent_session_id,
+                exc,
+            )
+
+    async def _deliver_spawn_result(
+        self,
+        adapter,
+        source: "SessionSource",
+        content: str,
+        *,
+        metadata: dict | None = None,
+        parent_session_id: str | None = None,
+    ):
+        """Persist a /spawn result to the parent transcript and deliver it with retry."""
+        self._persist_spawn_result_to_parent(parent_session_id, content)
+
+        send_with_retry = getattr(adapter, "_send_with_retry", None)
+        if callable(send_with_retry):
+            result = await send_with_retry(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=metadata,
+            )
+        else:
+            result = await adapter.send(
+                chat_id=source.chat_id,
+                content=content,
+                metadata=metadata,
+            )
+
+        if not getattr(result, "success", True):
+            error_detail = getattr(result, "error", None) or "unknown send failure"
+            logger.error(
+                "Failed to deliver /spawn result for task chat=%s parent=%s: %s",
+                source.chat_id,
+                parent_session_id,
+                error_detail,
+            )
+            self._persist_spawn_result_to_parent(
+                parent_session_id,
+                f"⚠️ Spawn result delivery to chat failed after retry: {error_detail}",
+            )
+        return result
+
     async def _run_background_task(
         self, prompt: str, source: "SessionSource", task_id: str
     ) -> None:
@@ -6402,6 +6544,156 @@ class GatewayRunner:
                     chat_id=source.chat_id,
                     content=f"❌ Background task {task_id} failed: {e}",
                     metadata=_thread_metadata,
+                )
+            except Exception:
+                pass
+
+    async def _run_spawn_task(
+        self,
+        prompt: str,
+        source: "SessionSource",
+        task_id: str,
+        child_session_id: str,
+        history_snapshot: list[dict],
+        parent_session_id: str | None = None,
+    ) -> None:
+        """Execute a cloned-session background task and deliver the result."""
+        from run_agent import AIAgent
+
+        adapter = self.adapters.get(source.platform)
+        if not adapter:
+            logger.warning("No adapter for platform %s in spawn task %s", source.platform, task_id)
+            return
+
+        if not hasattr(self, "_session_model_overrides"):
+            self._session_model_overrides = {}
+
+        _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+
+        try:
+            user_config = _load_gateway_config()
+            model, runtime_kwargs = self._resolve_session_agent_runtime(
+                source=source,
+                user_config=user_config,
+            )
+            if not runtime_kwargs.get("api_key"):
+                error_content = f"❌ Spawn task {task_id} failed: no provider credentials configured."
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    error_content,
+                    metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
+                )
+                return
+
+            platform_key = _platform_config_key(source.platform)
+
+            from hermes_cli.tools_config import _get_platform_tools
+            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+
+            pr = self._provider_routing
+            max_iterations = int(os.getenv("HERMES_MAX_ITERATIONS", "90"))
+            reasoning_config = self._load_reasoning_config()
+            self._reasoning_config = reasoning_config
+            self._service_tier = self._load_service_tier()
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+
+            def run_sync():
+                agent = AIAgent(
+                    model=turn_route["model"],
+                    **turn_route["runtime"],
+                    max_iterations=max_iterations,
+                    quiet_mode=True,
+                    verbose_logging=False,
+                    enabled_toolsets=enabled_toolsets,
+                    reasoning_config=reasoning_config,
+                    service_tier=self._service_tier,
+                    request_overrides=turn_route.get("request_overrides"),
+                    providers_allowed=pr.get("only"),
+                    providers_ignored=pr.get("ignore"),
+                    providers_order=pr.get("order"),
+                    provider_sort=pr.get("sort"),
+                    provider_require_parameters=pr.get("require_parameters", False),
+                    provider_data_collection=pr.get("data_collection"),
+                    session_id=child_session_id,
+                    platform=platform_key,
+                    user_id=source.user_id,
+                    session_db=self._session_db,
+                    fallback_model=self._fallback_model,
+                    pass_session_id=False,
+                )
+                try:
+                    return agent.run_conversation(
+                        user_message=prompt,
+                        conversation_history=history_snapshot,
+                        task_id=task_id,
+                    )
+                finally:
+                    self._cleanup_agent_resources(agent)
+
+            result = await self._run_in_executor_with_context(run_sync)
+
+            response = result.get("final_response", "") if result else ""
+            if not response and result and result.get("error"):
+                response = f"Error: {result['error']}"
+
+            preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
+            header = (
+                f'✅ Spawn task complete\n'
+                f'Prompt: "{preview}"\n'
+                f"Child session: {child_session_id}\n\n"
+            )
+
+            if response:
+                media_files, response = adapter.extract_media(response)
+                images, text_content = adapter.extract_images(response)
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    header + (text_content or "(See attached media)"),
+                    metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
+                )
+
+                for image_url, alt_text in (images or []):
+                    try:
+                        await adapter.send_image(
+                            chat_id=source.chat_id,
+                            image_url=image_url,
+                            caption=alt_text,
+                        )
+                    except Exception:
+                        pass
+
+                for media_item in (media_files or []):
+                    media_path = media_item[0] if isinstance(media_item, (tuple, list)) else media_item
+                    try:
+                        await adapter.send_document(
+                            chat_id=source.chat_id,
+                            file_path=media_path,
+                        )
+                    except Exception:
+                        pass
+            else:
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    header + "(No response generated)",
+                    metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
+                )
+
+        except Exception as e:
+            logger.exception("Spawn task %s failed", task_id)
+            try:
+                error_content = f"❌ Spawn task {task_id} failed: {e}"
+                await self._deliver_spawn_result(
+                    adapter,
+                    source,
+                    error_content,
+                    metadata=_thread_metadata,
+                    parent_session_id=parent_session_id,
                 )
             except Exception:
                 pass
