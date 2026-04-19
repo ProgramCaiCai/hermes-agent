@@ -1,37 +1,29 @@
-# Fork Patch 同步流程
+# Fork Patch 语义同步流程
 
-本文档描述本 fork 的长期维护方式。
+本文档定义本 fork 的默认同步方式。默认采用全托管语义同步，不再采用固定顺序机械 merge `patch/*`。
 
-目标分支结构：
+## 分支职责
 
-- `original`：严格对齐官方上游 `origin/main`
-- `patch/runtime-fixes`：运行时与兼容性补丁
-- `patch/custom-api-mode`：自定义 provider / `api_mode` 补丁
-- `patch/spawn-session`：`/spawn` 会话补丁
-- `patch/docs-sync-workflow`：fork 维护文档与同步流程约定
-- `main`：发布用整合分支，只承载 `original + patch/*` 的合成结果
+- `original`：严格对齐官方上游，只允许 `ff-only`
+- `rebuild/main-*`：每次同步时从最新 `original` 新建的语义重建分支
+- `main`：当前发布分支，是可重建产物，不是补丁真源
+- `patch/runtime-fixes`：运行时语义所有权分支；只保留仍未被 upstream 吸收的运行时差异
+- `patch/custom-api-mode`：`api_mode` 语义所有权分支；当前主要承担回归监控职责
+- `patch/spawn-session`：`/spawn` 语义所有权分支；当前仍是活跃 fork 能力
+- `patch/docs-sync-workflow`：fork 治理与同步规则分支
 
-原则：
+## 默认原则
 
-1. 不直接在 `original` 上开发
-2. 不把长期改动直接堆在 `main`
-3. 所有 fork 定制能力都尽量收敛到 `patch/*`
-4. `main` 可以重建，可以用 `--force-with-lease` 更新
-5. 开发目录与运行目录必须分离
-6. 正式版本只发布到 `~/.hermes/hermes-agent`
+- 不直接在 `original` 上开发
+- 不再把 `patch/*` 当作 merge-ready 文本补丁串
+- 不再维护固定 merge 顺序作为默认同步路径
+- 只保留仍然缺失的 fork 语义，不回放已被 upstream 吸收的旧实现
+- 先验证，再声明 patch 仍然有效
+- `main` 可以被新的 `rebuild/main-*` 覆盖，但覆盖前必须完成定向验证
 
-## 一次性认知
+## 语义同步步骤
 
-- 真正需要长期维护的是 `patch/*`
-- `original` 只是官方镜像
-- `main` 只是“当前发布版”
-- 如果以后新增功能，优先新建独立 `patch/<topic>`，不要继续往已有 patch 里乱塞
-
-## 日常同步流程
-
-以下命令默认在仓库根目录执行。
-
-### 1. 更新官方基线
+### 1. 更新上游基线
 
 ```bash
 git fetch origin
@@ -42,68 +34,73 @@ git push fork original
 
 要求：
 
-- `original` 不允许有本地私有提交
-- `merge --ff-only` 失败时，先检查是不是有人误改了 `original`
+- `original` 不允许带私有提交
+- 如果 `ff-only` 失败，先修正基线，而不是继续 patch 合并
 
-### 2. 从最新 `original` 重建新的集成分支
-
-建议每次同步都新起一个临时整合分支，不直接在旧 `main` 上硬 merge。
-
-当前固定合并顺序：
-
-1. `patch/runtime-fixes`
-2. `patch/custom-api-mode`
-3. `patch/spawn-session`
-4. `patch/docs-sync-workflow`
-
-这四个 patch 以后按上面顺序合并，不临时改顺序。
+### 2. 建立语义重建分支
 
 ```bash
 git switch -C rebuild/main-$(date +%Y%m%d) original
-git merge --no-ff patch/runtime-fixes -m "merge(patch): integrate runtime fixes"
-git merge --no-ff patch/custom-api-mode -m "merge(patch): integrate custom api mode"
-git merge --no-ff patch/spawn-session -m "merge(patch): integrate spawn session"
-git merge --no-ff patch/docs-sync-workflow -m "merge(patch): integrate docs sync workflow"
 ```
 
-如果以后增加新的 patch，就继续按固定顺序往下 merge。
+说明：
 
-建议：
+- rebuild 分支必须从干净 `original` 起步
+- 旧的冲突修补树不继续沿用
 
-- 先 merge 更底层、更通用的 patch
-- 再 merge 更偏功能性的 patch
-- 顺序一旦稳定下来，后面尽量不要频繁改
+### 3. 盘点 patch 语义，而不是机械合并 patch
 
-## 冲突处理原则
+同步前先回答四个问题：
 
-处理冲突时遵循这三个优先级：
+1. 这个 patch 的原始行为是什么
+2. 当前 upstream 是否已吸收
+3. 如果只吸收了一部分，剩余缺口是什么
+4. 这些缺口有没有现成测试或可写成定向回归
 
-1. 保留上游最新结构
-2. 只补回本 fork 真正需要的行为差异
-3. 能缩小 patch 范围就缩小，不要把已被上游吸收的逻辑重新带回来
+当前基线结论：
 
-尤其是 `patch/custom-api-mode`：
+- `patch/runtime-fixes`：已被 upstream 大体吸收，默认只做回归验证
+- `patch/custom-api-mode`：已被 upstream 大体吸收，默认只做回归验证
+- `patch/spawn-session`：仍需保留，当前 rebuild 已重建完整 `/spawn`
+- `patch/docs-sync-workflow`：继续保留，负责维护本治理文档
 
-- 上游已经吸收的 `api_mode` 传递链路不要重复背
-- 只保留 custom provider / delegation / 剩余缺口修复
+### 4. 只实现真实缺口
 
-## 验证
-
-整合完成后，至少做定向验证，再决定是否替换 `main`。
-
-示例：
+不要默认执行：
 
 ```bash
-python -m pytest -o addopts='' tests/run_agent/test_run_agent_codex_responses.py -q
-python -m pytest -o addopts='' tests/gateway/test_spawn_command.py -q
-python -m pytest -o addopts='' tests/hermes_cli/test_gateway_service.py -q
+git merge --no-ff patch/runtime-fixes
+git merge --no-ff patch/custom-api-mode
+git merge --no-ff patch/spawn-session
+git merge --no-ff patch/docs-sync-workflow
 ```
 
-如果当前环境缺依赖或 Python 版本不满足要求，需要在发布说明里明确写出，不能假装验证通过。
+这些命令不再是默认流程。只有在明确确认“某个 patch 仍以文本方式最小且正确”时，才允许局部参考其实现；默认做法是直接在 `rebuild/main-*` 上按当前架构重实现缺口语义。
 
-## 替换 main
+### 5. 做定向验证
 
-确认新整合分支可接受后，用它覆盖 `main`。
+本轮已验证的最小基线：
+
+```bash
+python -m pytest -o addopts='' tests/gateway/test_spawn_command.py -q
+python -m pytest -o addopts='' tests/run_agent/test_run_agent_codex_responses.py -q
+python -m pytest -o addopts='' tests/gateway/test_session_race_guard.py -q
+python -m pytest -o addopts='' tests/gateway/test_api_server.py -q
+python -m pytest -o addopts='' tests/gateway/test_telegram_network.py -q
+python -m pytest -o addopts='' tests/hermes_cli/test_model_provider_persistence.py -q
+python -m pytest -o addopts='' tests/hermes_cli/test_runtime_provider_resolution.py -q
+python -m pytest -o addopts='' tests/agent/test_auxiliary_client.py -q
+python -m pytest -o addopts='' tests/tools/test_delegate.py -q
+```
+
+如果验证失败：
+
+- 只修复失败所指向的语义缺口
+- 不允许借机整包回放旧 patch
+
+### 6. 更新 `main`
+
+当 rebuild 分支通过本轮所需验证后，再用它更新 `main`。
 
 ```bash
 git branch -f main HEAD
@@ -111,102 +108,55 @@ git switch main
 git push --force-with-lease fork main
 ```
 
-或者直接：
-
-```bash
-git push --force-with-lease fork HEAD:main
-```
-
 说明：
 
-- `main` 是可重建产物，不是补丁真源
-- 覆盖 `main` 前，建议先给旧远端 `main` 打一个 backup 分支
+- `main` 是发布产物，不是补丁真源
+- 覆盖前建议先备份远端 `main`
 
-示例：
+## patch 分支治理规则
 
-```bash
-git fetch fork main
-git push fork fork/main:refs/heads/backup/remote-main-before-sync-$(date +%Y%m%d)
-git push --force-with-lease fork HEAD:main
-```
+### `patch/runtime-fixes`
 
-## 新增补丁的方式
+- 默认目标：持续收缩
+- 只有当定向回归失败且 upstream 未吸收时，才保留代码差异
+- 如果长期无缺口，可冻结为文档/测试语义，甚至删除
 
-新增 fork 私有能力时，不要直接改 `main`，而是：
+### `patch/custom-api-mode`
 
-```bash
-git switch -c patch/<topic> original
-```
+- 默认目标：降级为回归监控分支
+- 当前不应再承载大块实现补丁
+- 只有发现新的 `api_mode` 真实回归时，才恢复最小代码差异
 
-然后在这个 patch 分支上独立开发、提交、验证。
+### `patch/spawn-session`
 
-等 patch 稳定后，再把它加入日常整合顺序。
+- 默认目标：保留 `/spawn` 活跃语义
+- 只围绕 `/spawn` 命令注册、忙时直通、子会话执行、父会话回写这四类核心行为演进
+- 不把无关能力塞进这个分支
 
-## 不建议的做法
+### `patch/docs-sync-workflow`
 
-不要这样做：
+- 默认目标：维护本治理文档和相关计划文档
+- 负责定义“哪些 patch 仍然活着，哪些已经被吸收”
+- 负责记录语义同步的验证门槛
 
-- 直接在 `original` 上改代码
-- 直接在 `main` 上堆长期提交
-- 把多个无关改动混进同一个 patch 分支
-- 为了省事，把上游已经修掉的逻辑继续整包保留
+## 不再允许的默认做法
+
+- 把固定顺序 `merge --no-ff patch/*` 当成默认同步流程
+- 为了省事保留已被 upstream 吸收的整块旧实现
+- 先合并再验证
+- 直接在旧 `main` 上硬修冲突
 - 未验证就覆盖远端 `main`
 
-## 建议的实际工作区布局
+## 开发目录与运行目录
 
-- 当前日常开发目录可以保留为 `wip/*`
-- `original`、`patch/*`、`main` 最好各自放在独立 worktree
-- 冲突解决和整合发布优先在干净 worktree 中完成
+- 开发 worktree 负责实现与验证
+- 运行目录 `~/.hermes/hermes-agent` 只承载已确认的发布结果
+- 不直接在运行目录里做长期开发
+- 安装目录需要保留 `venv`
 
-## 运行与发布约定
+## 当前结论
 
-- 开发环境与运行环境分离，不直接用开发 worktree 挂生产网关
-- fork 的正式发布目录固定为 `~/.hermes/hermes-agent`
-- 本地网关服务应从 `~/.hermes/hermes-agent` 版本启动
-- 开发 worktree 只用于开发、验证、重建 `main`
-- 验证通过后的正式版本，再同步到 `~/.hermes/hermes-agent`
-
-推荐流程：
-
-1. 在开发 worktree 中完成 patch 更新与 `main` 重建
-2. 在开发 worktree 中完成定向回归验证
-3. 将确认通过的正式版本同步到 `~/.hermes/hermes-agent`
-4. 用 `~/.hermes/hermes-agent` 版本刷新本地 gateway service
-
-## 安装目录同步规则
-
-- `~/.hermes/hermes-agent` 是运行目录，不是开发目录
-- 安装目录默认不保留脏改动；需要保留的内容应先转移到开发目录
-- 安装目录内的 `venv` 需要保留，不随代码同步一起删除
-- 安装目录的正式同步源使用 fork 远端，即 `programcaicai/*`
-
-推荐同步步骤：
-
-```bash
-git fetch programcaicai
-git branch -f original programcaicai/original
-git branch -f patch/runtime-fixes programcaicai/patch/runtime-fixes
-git branch -f patch/custom-api-mode programcaicai/patch/custom-api-mode
-git branch -f patch/spawn-session programcaicai/patch/spawn-session
-git branch -f patch/docs-sync-workflow programcaicai/patch/docs-sync-workflow
-git switch main
-git reset --hard programcaicai/main
-git branch --set-upstream-to=programcaicai/main main
-```
-
-如果需要清理安装目录中的临时文件，只清理代码产物，不删除 `venv`。
-
-## 本 fork 当前约定
-
-当前长期维护的 patch 分支：
-
-- `patch/runtime-fixes`
-- `patch/custom-api-mode`
-- `patch/spawn-session`
-- `patch/docs-sync-workflow`
-
-当前不纳入 patch 体系的本地临时改动：
-
-- Codex auth 同步修正相关脏改动
-
-如果未来这些临时改动也要长期保留，应该单独拆成新的 `patch/<topic>`，不要直接留在工作目录里。
+- 语义重建分支：`rebuild/main-20260419-semantic`
+- 当前确认需保留的活跃 fork 语义：`/spawn`
+- 当前确认已被 upstream 吸收的语义：`runtime-fixes`、`custom-api-mode`
+- 当前治理分支：`patch/docs-sync-workflow`
