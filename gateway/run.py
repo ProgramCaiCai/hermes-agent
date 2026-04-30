@@ -495,24 +495,90 @@ def _format_gateway_process_notification(evt: dict) -> "str | None":
     _cmd = evt.get("command", "unknown")
 
     if evt_type == "watch_disabled":
-        return f"[SYSTEM: {evt.get('message', '')}]"
+        text = f"[SYSTEM: {evt.get('message', '')}"
+        _coalesced = int(evt.get("_coalesced_count") or 0)
+        if _coalesced > 1:
+            text += f"\n({_coalesced - 1} earlier watch matches were coalesced)"
+        text += "]"
+        return text
 
     if evt_type == "watch_match":
         _pat = evt.get("pattern", "?")
         _out = evt.get("output", "")
         _sup = evt.get("suppressed", 0)
+        _coalesced = int(evt.get("_coalesced_count") or 1)
         text = (
             f"[SYSTEM: Background process {_sid} matched "
             f"watch pattern \"{_pat}\".\n"
             f"Command: {_cmd}\n"
             f"Matched output:\n{_out}"
         )
+        if _coalesced > 1:
+            text += f"\n({_coalesced - 1} additional watch matches were coalesced)"
         if _sup:
             text += f"\n({_sup} earlier matches were suppressed by rate limit)"
         text += "]"
         return text
 
     return None
+
+
+def _is_gateway_watch_notification_event(event: Any) -> bool:
+    """Return True for gateway-injected watch notification events."""
+    if not getattr(event, "internal", False):
+        return False
+    raw_message = getattr(event, "raw_message", None)
+    return (
+        isinstance(raw_message, dict)
+        and raw_message.get("gateway_internal_kind") == "watch_notification"
+    )
+
+
+def _coalesce_gateway_watch_events(events: list[dict]) -> list[dict]:
+    """Fold multiple watch events from the same process into one event."""
+    coalesced: list[dict] = []
+    by_process: dict[tuple[str, str], dict] = {}
+
+    for evt in events:
+        evt_type = evt.get("type", "completion")
+        if evt_type not in ("watch_match", "watch_disabled"):
+            continue
+
+        session_id = str(evt.get("session_id") or "")
+        command = str(evt.get("command") or "")
+        if not session_id:
+            coalesced.append(dict(evt))
+            continue
+
+        key = (session_id, command)
+        existing = by_process.get(key)
+        if existing is None:
+            folded = dict(evt)
+            if evt_type == "watch_match":
+                folded["_coalesced_count"] = 1
+            coalesced.append(folded)
+            by_process[key] = folded
+            continue
+
+        coalesced_count = int(existing.get("_coalesced_count") or 1) + 1
+        suppressed_count = int(existing.get("suppressed") or 0) + int(evt.get("suppressed") or 0)
+        existing["_coalesced_count"] = coalesced_count
+        existing["suppressed"] = suppressed_count
+
+        if evt_type == "watch_disabled":
+            existing.update(evt)
+            existing["_coalesced_count"] = coalesced_count
+            existing["suppressed"] = suppressed_count
+            continue
+
+        if existing.get("type") != "watch_disabled":
+            # Keep the latest delivered match as the actionable snippet while
+            # preserving the fact that this drain collapsed multiple hits.
+            existing["type"] = "watch_match"
+            existing["pattern"] = evt.get("pattern") or existing.get("pattern")
+            existing["output"] = evt.get("output") or existing.get("output")
+
+    return coalesced
 
 
 class GatewayRunner:
@@ -1394,6 +1460,38 @@ class GatewayRunner:
             metadata=thread_meta,
         )
         return True
+
+    async def _drain_watch_notifications(self, event: MessageEvent) -> None:
+        """Inject coalesced watch-pattern notifications after an agent turn."""
+        if _is_gateway_watch_notification_event(event):
+            logger.debug("Skipping watch notification drain for synthetic watch event")
+            return
+
+        try:
+            from tools.process_registry import process_registry as _pr
+
+            watch_events = []
+            while not _pr.completion_queue.empty():
+                evt = _pr.completion_queue.get_nowait()
+                evt_type = evt.get("type", "completion")
+                if evt_type in ("watch_match", "watch_disabled"):
+                    watch_events.append(evt)
+                # else: completion events are handled by the watcher task
+
+            notifications = [
+                text
+                for text in (
+                    _format_gateway_process_notification(evt)
+                    for evt in _coalesce_gateway_watch_events(watch_events)
+                )
+                if text
+            ]
+            if not notifications:
+                return
+
+            await self._inject_watch_notification("\n\n".join(notifications), event)
+        except Exception as e:
+            logger.debug("Watch queue drain error: %s", e)
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
@@ -3717,24 +3815,7 @@ class GatewayRunner:
             # Watch events and completions share the same queue; completions are
             # already handled by the per-process watcher task above, so we only
             # inject watch-type events here.
-            try:
-                from tools.process_registry import process_registry as _pr
-                _watch_events = []
-                while not _pr.completion_queue.empty():
-                    evt = _pr.completion_queue.get_nowait()
-                    evt_type = evt.get("type", "completion")
-                    if evt_type in ("watch_match", "watch_disabled"):
-                        _watch_events.append(evt)
-                    # else: completion events are handled by the watcher task
-                for evt in _watch_events:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if synth_text:
-                        try:
-                            await self._inject_watch_notification(synth_text, event)
-                        except Exception as e2:
-                            logger.error("Watch notification injection error: %s", e2)
-            except Exception as e:
-                logger.debug("Watch queue drain error: %s", e)
+            await self._drain_watch_notifications(event)
 
             # NOTE: Dangerous command approvals are now handled inline by the
             # blocking gateway approval mechanism in tools/approval.py.  The agent
@@ -7481,6 +7562,7 @@ class GatewayRunner:
                 text=synth_text,
                 message_type=MessageType.TEXT,
                 source=source,
+                raw_message={"gateway_internal_kind": "watch_notification"},
                 internal=True,
             )
             logger.info("Watch pattern notification — injecting for %s", platform_name)
